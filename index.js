@@ -1,118 +1,77 @@
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const P = require('pino');
 const express = require('express');
-const QRCode = require('qrcode');
 const cors = require('cors');
+const QRCode = require('qrcode');
 
-let sock;
-let isConnected = false;
-let latestQR = null;
-let latestQRAt = 0;
-const qrWaiters = [];
+const app = express();
+app.use(express.json());
+app.use(cors());
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+const sessions = new Map(); // userId -> { sock, ready, lastQrDataUrl, startedAt }
 
-  sock = makeWASocket({
+async function ensureSession(userId) {
+  if (sessions.has(userId)) return sessions.get(userId);
+
+  const authDir = `./sessions/${userId}`;
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+  const sock = makeWASocket({
     logger: P({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
   });
 
-  sock.ev.on('connection.update', (update) => {
+  const session = { sock, ready: false, lastQrDataUrl: null, startedAt: Date.now() };
+  sessions.set(userId, session);
+
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      latestQR = qr;
-      latestQRAt = Date.now();
-      while (qrWaiters.length) {
-        const resolve = qrWaiters.shift();
-        try { resolve(qr); } catch {}
-      }
-    }
-
+    if (qr) session.lastQrDataUrl = await QRCode.toDataURL(qr);
+    if (connection === 'open') session.ready = true;
     if (connection === 'close') {
-      isConnected = false;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('🔌 Conexão encerrada. Reconectar?', shouldReconnect);
-      if (shouldReconnect) startBot();
-    } else if (connection === 'open') {
-      isConnected = true;
-      console.log('✅ Bot conectado com sucesso!');
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      session.ready = false;
+      if (shouldReconnect) setTimeout(() => ensureSession(userId).catch(console.error), 2000);
+      else sessions.delete(userId);
     }
   });
 
   sock.ev.on('creds.update', saveCreds);
+  return session;
 }
 
-/** ---------------- Servidor HTTP ---------------- */
-const app = express();
-app.use(express.json());
-app.use(cors());
-
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
-app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// Ver status da sessão
-app.get('/session/status', (_req, res) => {
-  res.json({
-    connected: isConnected,
-    hasRecentQR: !!latestQR && (Date.now() - latestQRAt < 60_000),
-  });
-});
-
-// Criar QR Code em Base64
-app.get('/session/create', async (_req, res) => {
+/** QR por cliente */
+app.get('/api/qr', async (req, res) => {
   try {
-    if (!sock) startBot().catch((e) => console.error('Erro ao iniciar:', e));
+    const userId = String(req.query.userId || '').trim();
+    if (!userId) return res.status(400).json({ error: 'Informe userId' });
 
-    const hasRecentQR = latestQR && (Date.now() - latestQRAt < 60_000);
+    const session = await ensureSession(userId);
 
-    const qrString = hasRecentQR
-      ? latestQR
-      : await new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('timeout')), 20_000);
-          qrWaiters.push((qr) => {
-            clearTimeout(timeout);
-            resolve(qr);
-          });
-        });
+    if (session.ready) {
+      return res.json({ connected: true, qr_base64: null, expires_in_seconds: 0 });
+    }
 
-    const dataUrl = await QRCode.toDataURL(qrString, { width: 320, errorCorrectionLevel: 'M' });
-    res.json({ connected: isConnected, qr_base64: dataUrl, expires_in_seconds: 60 });
+    const t0 = Date.now();
+    while (!session.lastQrDataUrl && Date.now() - t0 < 8000) {
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    if (!session.lastQrDataUrl) {
+      return res.status(503).json({ connected: false, qr_base64: null, message: 'QR ainda não gerado, tente novamente.' });
+    }
+
+    res.json({ connected: false, qr_base64: session.lastQrDataUrl, expires_in_seconds: 60 });
   } catch (e) {
-    res.status(504).json({ error: 'QR ainda não disponível', details: String(e?.message || e) });
-  }
-});
-
-// Enviar mensagem de teste
-app.post('/sendMessage', async (req, res) => {
-  try {
-    if (!isConnected || !sock) return res.status(503).json({ error: 'Sessão não conectada' });
-
-    const { to, message } = req.body || {};
-    if (!to || !message) return res.status(400).json({ error: 'Informe "to" e "message"' });
-
-    const digits = String(to).replace(/\D/g, '');
-    const jid = `${digits}@s.whatsapp.net`;
-
-    await sock.sendMessage(jid, { text: message });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Erro /sendMessage:', e);
-    res.status(500).json({ error: 'Falha ao enviar mensagem', details: String(e?.message || e) });
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
-  startBot().catch((err) => {
-    console.error('Erro ao iniciar o bot:', err);
-    process.exit(1);
-  });
-});
-
-process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
-process.on('uncaughtException', (err) => console.error('uncaughtException:', err));
+app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
