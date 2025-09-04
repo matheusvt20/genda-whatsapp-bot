@@ -1,0 +1,13 @@
+{
+  "name": "genda-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp com Baileys",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.2",
+    "@hapi/boom": "^11.1.4"
+  }
+}
