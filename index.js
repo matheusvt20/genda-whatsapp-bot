@@ -11,56 +11,62 @@ const {
   default: makeWASocket,
   DisconnectReason,
   useMultiFileAuthState,
+  fetchLatestBaileysVersion, // ok manter mesmo se não atualizar pacote
 } = require('@whiskeysockets/baileys');
 
 /**
- * Memória de runtime (simples para MVP)
- * Dica: em produção grande, considere Redis/DB para cluster/escala.
+ * Memória de runtime (MVP)
  */
 const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
-const connections = new Map(); // userId -> boolean (true=conectado)
+const connections = new Map(); // userId -> boolean
 
 /**
- * Inicia (ou recupera) uma sessão de bot para um userId
+ * Inicia (ou recupera) sessão para userId
  */
 async function startBot(userId) {
-  // Evita recriar se já existir
   if (sessions.get(userId)) return sessions.get(userId);
 
-  const authDir = `./auth_info/${userId}`; // Render tem disco efêmero; ok para testes.
+  const authDir = `./auth_info/${userId}`;
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+  // Tenta pegar a versão mais nova; se falhar, usa fallback estável
+  let version = [2, 3000, 0];
+  try {
+    const v = await fetchLatestBaileysVersion();
+    if (v?.version) version = v.version;
+  } catch {}
+
   const sock = makeWASocket({
+    version,
     logger: P({ level: 'silent' }),
-    printQRInTerminal: false, // vamos servir o QR via HTTP (base64)
+    printQRInTerminal: false,
     auth: state,
+    browser: ['Genda', 'Chrome', '1.0.0'],
   });
 
-  // Atualiza credenciais quando mudarem
   sock.ev.on('creds.update', saveCreds);
 
-  // Eventos de conexão e QR
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      // QR novo — converte para PNG base64
       QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' })
         .then((dataUrl) => {
           lastQr.set(userId, {
-            qr_base64: dataUrl,             // pronto para <img src="...">
-            expires_in_seconds: 60,         // QR expira rápido
+            qr_base64: dataUrl,
+            expires_in_seconds: 60,
             timestamp: new Date().toISOString(),
           });
           connections.set(userId, false);
+          console.log(`🆗 QR gerado para ${userId} (válido ~60s)`);
         })
         .catch((err) => console.error('Erro ao gerar PNG do QR:', err));
     }
 
     if (connection === 'open') {
       connections.set(userId, true);
-      lastQr.delete(userId); // conectado => não precisamos mais do QR
+      lastQr.delete(userId);
       console.log(`✅ ${userId} conectado com sucesso!`);
     }
 
@@ -69,9 +75,7 @@ async function startBot(userId) {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       connections.set(userId, false);
       console.log(
-        '🔌 Conexão encerrada',
-        userId,
-        'reconectar?',
+        `🔌 Conexão encerrada ${userId} — reconectar?`,
         shouldReconnect,
         'statusCode:',
         statusCode
@@ -87,31 +91,33 @@ async function startBot(userId) {
 }
 
 /**
- * -----------------------
- * Servidor HTTP (Express)
- * -----------------------
+ * Servidor HTTP
  */
 const app = express();
 app.use(express.json());
 
-// ----------- CORS COMPLETO -----------
+// ----------- CORS (ajustado) -----------
 const allowedOrigins = [
   'https://usegenda.com',
   'http://localhost:3000',
   'http://localhost:5173',
   'https://localhost:3000',
-  // adicione abaixo o seu domínio de preview do Lovable (se tiver):
-  // 'https://seu-projeto.lovable.dev',
+  // adicione seu preview Lovable aqui se quiser fixo:
+  // 'https://SEU-PROJETO.lovable.dev',
 ];
 const lovableRegex = /^https:\/\/[a-z0-9-]+\.lovable\.dev$/i;
 
 app.use(cors({
   origin: function (origin, callback) {
-    // permitir requests sem Origin (abrir a URL direto no navegador)
+    // 1) Permitir requisições sem Origin (navegador abrindo direto, health checks, curl)
     if (!origin) return callback(null, true);
+
+    // 2) Permitir lista fixa e *.lovable.dev
     if (allowedOrigins.includes(origin) || lovableRegex.test(origin)) {
       return callback(null, true);
     }
+
+    // 3) Bloquear outras origens
     return callback(new Error('Not allowed by CORS: ' + origin));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -122,18 +128,13 @@ app.use(cors({
 // Preflight para qualquer rota
 app.options('*', cors());
 
-// ----------- HEALTH/ROOT -----------
-app.get('/', (_req, res) => {
-  res.send('Genda WhatsApp Bot ✅ Online');
-});
-
-app.get('/healthz', (_req, res) =>
-  res.json({ ok: true, timestamp: new Date().toISOString() })
-);
+// ----------- HEALTH -----------
+app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
+app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
 /**
- * Inicia uma sessão (ou confirma se já está iniciada)
  * GET /api/connect?userId=XYZ
+ * Inicia (ou confirma) a sessão
  */
 app.get('/api/connect', async (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -150,13 +151,10 @@ app.get('/api/connect', async (req, res) => {
 });
 
 /**
- * Retorna o último QR disponível
  * GET /api/qr?userId=XYZ
- *
- * CONTRATO (para o front do Genda/Lovable):
- * - Se houver QR: { ok:true, status:"qr", qr:"data:image/png;base64,..." }
- * - Se já estiver conectado: { ok:true, status:"connected" }
- * - Se ainda não gerou QR e não conectado: { ok:false, status:"offline" }
+ * - Se QR disponível: { ok:true, status:"qr", qr:"data:image/png;base64,..." }
+ * - Se conectado:     { ok:true, status:"connected" }
+ * - Se offline:       { ok:false, status:"offline" }
  */
 app.get('/api/qr', (req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -166,22 +164,14 @@ app.get('/api/qr', (req, res) => {
   const isConnected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
 
-  if (isConnected) {
-    return res.json({ ok: true, status: 'connected' });
-  }
-
-  if (qrInfo && qrInfo.qr_base64) {
-    return res.json({ ok: true, status: 'qr', qr: qrInfo.qr_base64 });
-  }
+  if (isConnected) return res.json({ ok: true, status: 'connected' });
+  if (qrInfo?.qr_base64) return res.json({ ok: true, status: 'qr', qr: qrInfo.qr_base64 });
 
   return res.status(404).json({ ok: false, status: 'offline' });
 });
 
 /**
- * Status de conexão
  * GET /api/status?userId=XYZ
- *
- * CONTRATO (para o front):
  * { ok:true, service:"whatsapp-bot", status:"connected|qr|offline", timestamp:"..." }
  */
 app.get('/api/status', (req, res) => {
@@ -194,7 +184,7 @@ app.get('/api/status', (req, res) => {
 
   let status = 'offline';
   if (isConnected) status = 'connected';
-  else if (qrInfo && qrInfo.qr_base64) status = 'qr';
+  else if (qrInfo?.qr_base64) status = 'qr';
 
   return res.json({
     ok: true,
@@ -204,8 +194,6 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// Porta para Render
+// Porta (Render define via env)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
