@@ -1,15 +1,16 @@
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const P = require('pino');
 const express = require('express');
-
-const { state, saveState } = useSingleFileAuthState('./auth_info.json');
 
 let sock;
 
 async function startBot() {
+  // usa pasta "auth_info" para salvar a sessão
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+
   sock = makeWASocket({
     logger: P({ level: 'silent' }),
-    printQRInTerminal: true, // depois vamos expor via API
+    printQRInTerminal: true, // por enquanto, QR só aparece nos logs do Render
     auth: state,
   });
 
@@ -17,7 +18,6 @@ async function startBot() {
     const { connection, lastDisconnect } = update;
 
     if (connection === 'close') {
-      // se NÃO foi logout explícito, tenta reconectar
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log('🔌 Conexão encerrada. Reconectar?', shouldReconnect, 'statusCode:', statusCode);
@@ -27,7 +27,7 @@ async function startBot() {
     }
   });
 
-  sock.ev.on('creds.update', saveState);
+  sock.ev.on('creds.update', saveCreds);
 }
 
 /** Servidor HTTP (Render precisa de uma porta aberta) */
