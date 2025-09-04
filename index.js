@@ -1,29 +1,28 @@
 const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const fs = require('fs');
+const P = require('pino');
 
 const { state, saveState } = useSingleFileAuthState('./auth_info.json');
 
-async function startSock() {
+async function startBot() {
   const sock = makeWASocket({
+    logger: P({ level: 'silent' }),
+    printQRInTerminal: true,
     auth: state,
-    printQRInTerminal: true
   });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
+
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('connection closed due to', lastDisconnect.error, ', reconnecting:', shouldReconnect);
-      if (shouldReconnect) {
-        startSock();
-      }
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('📴 Conexão encerrada, reconectando:', shouldReconnect);
+      if (shouldReconnect) startBot();
     } else if (connection === 'open') {
-      console.log('🟢 Conectado com sucesso!');
+      console.log('✅ Bot conectado com sucesso!');
     }
   });
 
   sock.ev.on('creds.update', saveState);
 }
 
-startSock();
+startBot();
