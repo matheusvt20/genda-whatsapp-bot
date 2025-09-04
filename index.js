@@ -2,76 +2,68 @@ const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = requi
 const P = require('pino');
 const express = require('express');
 const cors = require('cors');
-const QRCode = require('qrcode');
 
-const app = express();
-app.use(express.json());
-app.use(cors());
+let sock;
 
-const sessions = new Map(); // userId -> { sock, ready, lastQrDataUrl, startedAt }
+async function startBot() {
+  // usa pasta "auth_info" para salvar a sessão
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
 
-async function ensureSession(userId) {
-  if (sessions.has(userId)) return sessions.get(userId);
-
-  const authDir = `./sessions/${userId}`;
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  const sock = makeWASocket({
+  sock = makeWASocket({
     logger: P({ level: 'silent' }),
-    printQRInTerminal: false,
     auth: state,
   });
 
-  const session = { sock, ready: false, lastQrDataUrl: null, startedAt: Date.now() };
-  sessions.set(userId, session);
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) session.lastQrDataUrl = await QRCode.toDataURL(qr);
-    if (connection === 'open') session.ready = true;
     if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      session.ready = false;
-      if (shouldReconnect) setTimeout(() => ensureSession(userId).catch(console.error), 2000);
-      else sessions.delete(userId);
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log('🔌 Conexão encerrada. Reconectar?', shouldReconnect, 'statusCode:', statusCode);
+      if (shouldReconnect) startBot();
+    } else if (connection === 'open') {
+      console.log('✅ Bot conectado com sucesso!');
     }
   });
 
   sock.ev.on('creds.update', saveCreds);
-  return session;
 }
 
+// servidor HTTP (Render precisa de uma porta aberta)
+const app = express();
+app.use(express.json());
+
+// 🔹 Configuração de CORS
+app.use(cors({
+  origin: [
+    'https://usegenda.com',   // domínio do seu front Lovable
+    'http://localhost:3000'   // para testes locais
+  ],
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
+// rotas simples
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
+app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-/** QR por cliente */
-app.get('/api/qr', async (req, res) => {
-  try {
-    const userId = String(req.query.userId || '').trim();
-    if (!userId) return res.status(400).json({ error: 'Informe userId' });
-
-    const session = await ensureSession(userId);
-
-    if (session.ready) {
-      return res.json({ connected: true, qr_base64: null, expires_in_seconds: 0 });
-    }
-
-    const t0 = Date.now();
-    while (!session.lastQrDataUrl && Date.now() - t0 < 8000) {
-      await new Promise(r => setTimeout(r, 250));
-    }
-
-    if (!session.lastQrDataUrl) {
-      return res.status(503).json({ connected: false, qr_base64: null, message: 'QR ainda não gerado, tente novamente.' });
-    }
-
-    res.json({ connected: false, qr_base64: session.lastQrDataUrl, expires_in_seconds: 60 });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
+// rota exemplo para Lovable testar conexão
+app.get('/api/status', (req, res) => {
+  res.json({
+    connected: !!sock,
+    timestamp: new Date().toISOString()
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
+  startBot().catch((err) => {
+    console.error('Erro ao iniciar o bot:', err);
+    process.exit(1);
+  });
+});
+
+process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err));
+process.on('uncaughtException', (err) => console.error('uncaughtException:', err));
