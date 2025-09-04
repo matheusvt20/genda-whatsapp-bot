@@ -1,5 +1,6 @@
 const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const P = require('pino');
+const Boom = require('@hapi/boom');
 
 const { state, saveState } = useSingleFileAuthState('./auth_info.json');
 
@@ -15,7 +16,7 @@ async function startBot() {
 
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('📴 Conexão encerrada, reconectando:', shouldReconnect);
+      console.log('⚠️ Conexão encerrada, reconectando:', shouldReconnect);
       if (shouldReconnect) startBot();
     } else if (connection === 'open') {
       console.log('✅ Bot conectado com sucesso!');
