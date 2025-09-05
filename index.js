@@ -9,6 +9,8 @@ const {
   fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 
+const { isOriginAllowed } = require('./cors-allow');
+
 const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map(); // userId -> boolean
@@ -79,28 +81,18 @@ async function startBot(userId) {
 const app = express();
 app.use(express.json());
 
-// CORS
-const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const defaultOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5173',
-  'https://localhost:3000',
-  'https://usegenda.com',
-  'https://www.usegenda.com',
-  /\.lovable\.dev$/,
-  /\.lovable\.app$/,
-];
+// CORS com helper testável
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (allowedFromEnv.includes(origin)) return cb(null, true);
-    const ok = defaultOrigins.some(o => (o instanceof RegExp ? o.test(origin) : o === origin));
-    return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`));
+    return isOriginAllowed(origin)
+      ? cb(null, true)
+      : cb(new Error(`Not allowed by CORS: ${origin}`));
   },
   credentials: true,
 };
 app.use(cors(corsOptions));
+// opcional: pré-flight explicito
+// app.options('*', cors(corsOptions));
 
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
