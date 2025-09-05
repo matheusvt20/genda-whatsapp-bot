@@ -1,4 +1,3 @@
-// index.js
 const express = require('express');
 const cors = require('cors');
 const P = require('pino');
@@ -106,9 +105,11 @@ app.use(cors(corsOptions));
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// 🔗 Agora o /api/qr também inicia a sessão se necessário
+// 🔗 /api/qr — inicia sessão se necessário e retorna QR válido ou status
 app.get('/api/qr', async (req, res) => {
-  res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
@@ -125,8 +126,19 @@ app.get('/api/qr', async (req, res) => {
   const connected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
 
-  if (connected) return res.json({ ok: true, status: 'connected', connected: true });
+  if (connected) {
+    return res.json({ ok: true, status: 'connected', connected: true });
+  }
+
   if (qrInfo) {
+    const ttl = Number(qrInfo.expires_in_seconds ?? 60);
+    const ageSec = Math.floor((Date.now() - Date.parse(qrInfo.timestamp)) / 1000);
+
+    if (Number.isFinite(ttl) && ageSec >= ttl) {
+      lastQr.delete(userId);
+      return res.json({ ok: false, status: 'offline', connected: false, expired: true });
+    }
+
     return res.json({
       ok: true,
       status: 'qr',
@@ -137,6 +149,7 @@ app.get('/api/qr', async (req, res) => {
       timestamp: qrInfo.timestamp,
     });
   }
+
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
