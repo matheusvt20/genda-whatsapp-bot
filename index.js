@@ -1,4 +1,4 @@
-// index.js — Genda WhatsApp Bot (com /api/send)
+// index.js — Genda WhatsApp Bot (QR com espera, restart e diag)
 
 const express = require('express');
 const cors = require('cors');
@@ -94,13 +94,39 @@ const corsOptions = {
   credentials: true,
 };
 app.use(cors(corsOptions));
-// app.options('*', cors(corsOptions)); // (opcional) habilitar preflight explícito
 
-// Health & raiz
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// 🔗 /api/qr — inicia sessão se necessário e retorna QR válido ou status
+// helper de resposta (inclui expiração do QR)
+function buildQrResponse(userId) {
+  const connected = !!connections.get(userId);
+  const qrInfo = lastQr.get(userId);
+
+  if (connected) return { ok: true, status: 'connected', connected: true };
+
+  if (qrInfo) {
+    const ttl = Number(qrInfo.expires_in_seconds ?? 60);
+    const ageSec = Math.floor((Date.now() - Date.parse(qrInfo.timestamp)) / 1000);
+    if (Number.isFinite(ttl) && ageSec >= ttl) {
+      lastQr.delete(userId);
+      return { ok: false, status: 'offline', connected: false, expired: true };
+    }
+    return {
+      ok: true,
+      status: 'qr',
+      connected: false,
+      qr: qrInfo.qr_base64,
+      qr_base64: qrInfo.qr_base64,
+      expires_in_seconds: qrInfo.expires_in_seconds,
+      timestamp: qrInfo.timestamp,
+    };
+  }
+
+  return { ok: false, status: 'offline', connected: false };
+}
+
+// 🔗 /api/qr — inicia sessão (se preciso) e aguarda até 10s por um QR
 app.get('/api/qr', async (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -118,34 +144,19 @@ app.get('/api/qr', async (req, res) => {
     }
   }
 
-  const connected = !!connections.get(userId);
-  const qrInfo = lastQr.get(userId);
+  // tenta imediatamente
+  let resp = buildQrResponse(userId);
+  if (resp.status !== 'offline') return res.json(resp);
 
-  if (connected) {
-    return res.json({ ok: true, status: 'connected', connected: true });
+  // espera ativa até 10s por um QR novo
+  const waitUntil = Date.now() + 10_000;
+  while (Date.now() < waitUntil) {
+    await new Promise(r => setTimeout(r, 300));
+    resp = buildQrResponse(userId);
+    if (resp.status !== 'offline') break;
   }
 
-  if (qrInfo) {
-    const ttl = Number(qrInfo.expires_in_seconds ?? 60);
-    const ageSec = Math.floor((Date.now() - Date.parse(qrInfo.timestamp)) / 1000);
-
-    if (Number.isFinite(ttl) && ageSec >= ttl) {
-      lastQr.delete(userId);
-      return res.json({ ok: false, status: 'offline', connected: false, expired: true });
-    }
-
-    return res.json({
-      ok: true,
-      status: 'qr',
-      connected: false,
-      qr: qrInfo.qr_base64,
-      qr_base64: qrInfo.qr_base64,
-      expires_in_seconds: qrInfo.expires_in_seconds,
-      timestamp: qrInfo.timestamp,
-    });
-  }
-
-  return res.json({ ok: false, status: 'offline', connected: false });
+  return res.json(resp);
 });
 
 // Status da sessão
@@ -173,7 +184,6 @@ app.post('/api/send', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'NOT_CONNECTED', hint: 'Conecte via /api/qr primeiro' });
     }
 
-    // Normaliza número: só dígitos → 55 + DDD + número
     const digits = String(to).replace(/\D/g, '');
     if (digits.length < 10) {
       return res.status(400).json({ ok: false, error: 'INVALID_NUMBER', hint: 'Use 55DDDNUMERO (só dígitos)' });
@@ -188,16 +198,58 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// Desconectar/resetar sessão
+// 🔁 Reiniciar sessão (sem perder credenciais) — força reemissão de QR
+app.post('/api/restart', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+    const sock = sessions.get(userId);
+    if (sock && sock.ws && sock.ws.close) {
+      try { sock.ws.close(); } catch {}
+    }
+    sessions.delete(userId);
+    connections.delete(userId);
+    lastQr.delete(userId);
+
+    await startBot(userId);
+    return res.json({ ok: true, restarted: true, userId });
+  } catch (e) {
+    console.error('restart error', e);
+    return res.status(500).json({ ok: false, error: 'RESTART_FAILED' });
+  }
+});
+
+// 🔎 Diagnóstico simples
+app.get('/api/diag', (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+  const hasSession = sessions.has(userId);
+  const connected = !!connections.get(userId);
+  const qrInfo = lastQr.get(userId);
+  const now = Date.now();
+  const ageSec = qrInfo?.timestamp ? Math.floor((now - Date.parse(qrInfo.timestamp)) / 1000) : null;
+
+  res.json({
+    ok: true,
+    userId,
+    hasSession,
+    connected,
+    hasQr: !!qrInfo,
+    qrAgeSec: ageSec,
+    qrExpiresInSec: qrInfo?.expires_in_seconds ?? null,
+  });
+});
+
+// Desconectar/resetar sessão (apaga credenciais em memória)
 app.get('/api/disconnect', (req, res) => {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
   const sock = sessions.get(userId);
   if (sock) {
-    try {
-      sock.logout();
-    } catch (_) {}
+    try { sock.logout(); } catch (_) {}
     sessions.delete(userId);
     connections.delete(userId);
     lastQr.delete(userId);
