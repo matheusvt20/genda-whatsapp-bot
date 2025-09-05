@@ -27,12 +27,14 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    // Agora finge um Chrome Android (mais estável que iPhone)
-    browser: ['Chrome', 'Android', '10'],
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    connectTimeoutMs: 60_000,
+    // 🔹 Simula um iPhone real com Safari
+    browser: ['Safari', 'iPhone', '16.6.1'],
+    // 🔹 Mais tolerância no login
+    connectTimeoutMs: 120_000,
     keepAliveIntervalMs: 15_000,
+    // 🔹 Deixa mais parecido com login oficial
+    syncFullHistory: true,
+    markOnlineOnConnect: false,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -64,22 +66,18 @@ async function startBot(userId) {
       const statusCode = boom?.output?.statusCode || boom?.data?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       connections.set(userId, false);
-
-      if (statusCode === 515) {
-        console.log(`⚠️ ${userId} caiu com erro 515 (normal após parear). Vai tentar reconectar...`);
-      } else {
-        console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — reconectar? ${shouldReconnect}`);
-      }
-
+      console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — reconectar? ${shouldReconnect}`);
       if (shouldReconnect) setTimeout(() => startBot(userId).catch(console.error), 2000);
     }
   });
 
-  // Logs extras
+  // Logs úteis pra ver progresso do login
   sock.ev.on('auth-state.update', (s) =>
     console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando')
   );
-  sock.ev.on('messaging-history.set', () => console.log(`🗂️ history set ${userId}`));
+  sock.ev.on('messaging-history.set', () =>
+    console.log(`🗂️ history set ${userId}`)
+  );
 
   sessions.set(userId, sock);
   return sock;
@@ -137,15 +135,17 @@ app.get('/api/qr', (req, res) => {
 
   if (connected) return res.json({ ok: true, status: 'connected', connected: true });
   if (qrInfo) {
-    return res.send(`
-      <html><body style="font-family:sans-serif;text-align:center;">
-        <h2>📱 Escaneie o QR para conectar</h2>
-        <img src="${qrInfo.qr_base64}" />
-        <p>Expira em ~${qrInfo.expires_in_seconds}s</p>
-      </body></html>
-    `);
+    return res.json({
+      ok: true,
+      status: 'qr',
+      connected: false,
+      qr: qrInfo.qr_base64,
+      qr_base64: qrInfo.qr_base64,
+      expires_in_seconds: qrInfo.expires_in_seconds,
+      timestamp: qrInfo.timestamp,
+    });
   }
-  return res.send('<h3>❌ Nenhum QR disponível. Tente /api/connect primeiro.</h3>');
+  return res.json({ ok: false, status: 'offline', connected: false });
 });
 
 app.get('/api/status', (req, res) => {
@@ -155,27 +155,6 @@ app.get('/api/status', (req, res) => {
   const connected = !!connections.get(userId);
   const status = connected ? 'connected' : (lastQr.has(userId) ? 'qr' : 'offline');
   res.json({ ok: true, status, connected, timestamp: new Date().toISOString() });
-});
-
-// Forçar logout/reset
-app.get('/api/disconnect', async (req, res) => {
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
-
-  try {
-    const sock = sessions.get(userId);
-    if (sock) {
-      await sock.logout();
-      sessions.delete(userId);
-      connections.set(userId, false);
-      lastQr.delete(userId);
-      return res.json({ ok: true, disconnected: true, userId });
-    }
-    return res.json({ ok: false, error: 'SESSION_NOT_FOUND' });
-  } catch (e) {
-    console.error('Erro /api/disconnect:', e);
-    return res.status(500).json({ ok: false, error: 'DISCONNECT_FAILED' });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
