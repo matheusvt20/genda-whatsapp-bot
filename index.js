@@ -1,3 +1,5 @@
+// index.js — Genda WhatsApp Bot (com /api/send)
+
 const express = require('express');
 const cors = require('cors');
 const P = require('pino');
@@ -39,6 +41,7 @@ async function startBot(userId) {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
+
     if (qr) {
       QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' })
         .then((dataUrl) => {
@@ -81,7 +84,7 @@ async function startBot(userId) {
 const app = express();
 app.use(express.json());
 
-// CORS com helper testável
+// CORS usando helper testável
 const corsOptions = {
   origin(origin, cb) {
     return isOriginAllowed(origin)
@@ -91,9 +94,9 @@ const corsOptions = {
   credentials: true,
 };
 app.use(cors(corsOptions));
-// opcional: pré-flight explicito
-// app.options('*', cors(corsOptions));
+// app.options('*', cors(corsOptions)); // (opcional) habilitar preflight explícito
 
+// Health & raiz
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
@@ -145,6 +148,7 @@ app.get('/api/qr', async (req, res) => {
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
+// Status da sessão
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -154,7 +158,37 @@ app.get('/api/status', (req, res) => {
   res.json({ ok: true, status, connected, timestamp: new Date().toISOString() });
 });
 
-// opcional: desconectar/resetar sessão
+// ▶️ Envio de mensagem: POST /api/send
+// Body JSON: { "userId": "ID_DONO_SESSAO", "to": "55DDDNUMERO", "text": "sua mensagem" }
+app.post('/api/send', async (req, res) => {
+  try {
+    const { userId, to, text } = req.body || {};
+    if (!userId || !to || !text) {
+      return res.status(400).json({ ok: false, error: 'MISSING_FIELDS', hint: 'Informe userId, to e text' });
+    }
+
+    const sock = sessions.get(userId);
+    const isConnected = connections.get(userId);
+    if (!sock || !isConnected) {
+      return res.status(400).json({ ok: false, error: 'NOT_CONNECTED', hint: 'Conecte via /api/qr primeiro' });
+    }
+
+    // Normaliza número: só dígitos → 55 + DDD + número
+    const digits = String(to).replace(/\D/g, '');
+    if (digits.length < 10) {
+      return res.status(400).json({ ok: false, error: 'INVALID_NUMBER', hint: 'Use 55DDDNUMERO (só dígitos)' });
+    }
+    const jid = `${digits}@s.whatsapp.net`;
+
+    await sock.sendMessage(jid, { text });
+    return res.json({ ok: true, sent: true, to: jid });
+  } catch (e) {
+    console.error('send error', e);
+    return res.status(500).json({ ok: false, error: 'SEND_FAILED' });
+  }
+});
+
+// Desconectar/resetar sessão
 app.get('/api/disconnect', (req, res) => {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
