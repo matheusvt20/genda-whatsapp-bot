@@ -1,4 +1,4 @@
-// index.js — Genda WhatsApp Bot (com UI e CORS ajustado para testes locais)
+// index.js — Genda WhatsApp Bot (com UI, CORS ajustado e rotas de manutenção)
 
 const express = require('express');
 const cors = require('cors');
@@ -69,10 +69,12 @@ async function startBot(userId) {
     if (connection === 'close') {
       const boom = lastDisconnect?.error;
       const statusCode = boom?.output?.statusCode || boom?.data?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
       connections.set(userId, false);
-      console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — reconectar? ${shouldReconnect}`);
-      if (shouldReconnect) setTimeout(() => startBot(userId).catch(console.error), 2000);
+      console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — loggedOut? ${loggedOut}`);
+      if (!loggedOut) {
+        setTimeout(() => startBot(userId).catch(console.error), 2000);
+      }
     }
   });
 
@@ -197,8 +199,83 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// outras rotas (restart, wipe, diag, disconnect) — permanecem iguais ao seu index atual
-// ...
+// ====== ROTAS DE MANUTENÇÃO ======
+
+function getAuthDirFor(userId) {
+  return path.join(AUTH_BASE_DIR, userId);
+}
+
+async function closeSession(userId, reason = 'manual') {
+  const sock = sessions.get(userId);
+  try {
+    if (sock) {
+      console.log(`↘️ Fechando sessão de ${userId} (${reason})`);
+      try { await sock.logout?.(); } catch {}
+      try { await sock.ws?.close?.(); } catch {}
+      try { await sock.end?.(); } catch {}
+    }
+  } catch (e) {
+    console.warn('Erro ao fechar sessão:', e?.message || e);
+  } finally {
+    sessions.delete(userId);
+    connections.set(userId, false);
+    lastQr.delete(userId);
+  }
+}
+
+// 🔌 Desconectar (mantém credenciais no disco)
+app.post('/api/disconnect', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+    await closeSession(userId, 'disconnect');
+    return res.json({ ok: true, disconnected: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'DISCONNECT_FAILED' });
+  }
+});
+
+// 🧹 Wipe total: apaga credenciais e força novo QR
+app.post('/api/wipe', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+    await closeSession(userId, 'wipe');
+    const dir = getAuthDirFor(userId);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log('🗑️ Auth dir removido:', dir);
+    } catch (e) {
+      console.warn('Falha ao remover auth dir (pode não existir):', e?.message);
+    }
+
+    // já reinicia automaticamente
+    startBot(userId).catch(console.error);
+    return res.json({ ok: true, wiped: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'WIPE_FAILED' });
+  }
+});
+
+// ♻️ Restart: fecha e reabre a sessão (mantém credenciais)
+app.post('/api/restart', async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+    await closeSession(userId, 'restart');
+    await startBot(userId);
+    return res.json({ ok: true, restarted: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'RESTART_FAILED' });
+  }
+});
+
+// ====== FIM DAS ROTAS DE MANUTENÇÃO ======
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
