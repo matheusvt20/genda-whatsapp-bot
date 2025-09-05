@@ -27,9 +27,7 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    // Finge desktop comum (ajuda no link)
     browser: ['Chrome', 'Windows', '10.0'],
-    // Estabilidade
     markOnlineOnConnect: false,
     syncFullHistory: false,
     connectTimeoutMs: 60_000,
@@ -40,7 +38,6 @@ async function startBot(userId) {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
       QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' })
         .then((dataUrl) => {
@@ -71,11 +68,12 @@ async function startBot(userId) {
     }
   });
 
-  // Logs úteis
   sock.ev.on('auth-state.update', (s) =>
     console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando')
   );
-  sock.ev.on('messaging-history.set', () => console.log(`🗂️ history set ${userId}`));
+  sock.ev.on('messaging-history.set', () =>
+    console.log(`🗂️ history set ${userId}`)
+  );
 
   sessions.set(userId, sock);
   return sock;
@@ -98,7 +96,7 @@ const defaultOrigins = [
 ];
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // Origin:null (apps/preview)
+    if (!origin) return cb(null, true);
     if (allowedFromEnv.includes(origin)) return cb(null, true);
     const ok = defaultOrigins.some(o => (o instanceof RegExp ? o.test(origin) : o === origin));
     return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`));
@@ -107,11 +105,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Health & root
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// Iniciar/reativar sessão
 app.get('/api/connect', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -125,7 +121,6 @@ app.get('/api/connect', async (req, res) => {
   }
 });
 
-// QR em JSON (base64)
 app.get('/api/qr', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -149,7 +144,25 @@ app.get('/api/qr', (req, res) => {
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
-// Status
+// Novo endpoint que mostra QR em HTML
+app.get('/api/qr/html', (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.send('<h1>❌ Informe userId</h1>');
+
+  const qrInfo = lastQr.get(userId);
+  if (!qrInfo) return res.send('<h1>❌ Nenhum QR disponível. Tente /api/connect primeiro.</h1>');
+
+  res.send(`
+    <html>
+      <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
+        <h2>📲 Escaneie o QR para conectar</h2>
+        <img src="${qrInfo.qr_base64}" />
+        <p>Válido até: ${qrInfo.timestamp}</p>
+      </body>
+    </html>
+  `);
+});
+
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -159,131 +172,5 @@ app.get('/api/status', (req, res) => {
   res.json({ ok: true, status, connected, timestamp: new Date().toISOString() });
 });
 
-// QR como imagem simples (HTML)
-app.get('/api/qr-image', (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).send('MISSING_USER_ID');
-
-  const qrInfo = lastQr.get(userId);
-  if (!qrInfo) {
-    return res.send('❌ Nenhum QR disponível. Tente /api/connect primeiro.');
-  }
-  res.send(`
-    <html>
-      <body style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:sans-serif;">
-        <h2>Escaneie o QR no WhatsApp</h2>
-        <img src="${qrInfo.qr_base64}" style="width:300px;height:300px;" />
-        <p>Expira em ~${qrInfo.expires_in_seconds}s</p>
-      </body>
-    </html>
-  `);
-});
-
-// Página amigável: auto-connect + polling do QR
-app.get('/qr', (req, res) => {
-  const userId = req.query.userId || '';
-  res.set('Cache-Control', 'no-store');
-  if (!userId) return res.status(400).send('MISSING_USER_ID');
-
-  res.send(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>QR WhatsApp – ${userId}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; background:#0b0b0b; color:#fff; display:flex; min-height:100vh; align-items:center; justify-content:center; }
-    .card { background:#161616; padding:24px; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.4); width: min(92vw, 440px); text-align:center; }
-    img { width:320px; height:320px; border-radius:8px; background:#fff; }
-    .muted { color:#9aa0a6; font-size:12px; margin-top:8px; }
-    button { margin-top:14px; padding:10px 16px; border:none; border-radius:10px; background:#4f46e5; color:#fff; cursor:pointer; }
-    button:disabled { background:#3b3b3b; cursor:not-allowed; }
-    .ok { color:#10b981; }
-    .warn { color:#f59e0b; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Conectar WhatsApp</h2>
-    <div id="status" class="muted">Preparando…</div>
-    <div style="margin:14px 0;">
-      <img id="qr" alt="QR" src="" style="display:none"/>
-    </div>
-    <button id="btn" disabled>Conectar</button>
-    <div class="muted">Usuário: <b>${userId}</b></div>
-  </div>
-
-<script>
-const userId = ${JSON.stringify(userId)};
-const btn = document.getElementById('btn');
-const qrImg = document.getElementById('qr');
-const statusEl = document.getElementById('status');
-
-async function call(path){
-  const url = path + '?userId=' + encodeURIComponent(userId);
-  const res = await fetch(url, { cache:'no-store' });
-  return res;
-}
-async function json(path){
-  const r = await call(path);
-  return r.ok ? r.json() : null;
-}
-function setStatus(html){ statusEl.innerHTML = html; }
-
-async function ensureStarted(){
-  setStatus('Iniciando sessão…');
-  try {
-    const r = await json('/api/connect');
-    if(r && r.ok){ setStatus('Sessão iniciada. Aguardando QR…'); }
-  } catch(e){ setStatus('<span class="warn">Falha ao iniciar.</span>'); }
-}
-
-async function poll(){
-  try{
-    const st = await json('/api/status');
-    if(!st){ setStatus('<span class="warn">Sem resposta do servidor.</span>'); return; }
-    if(st.connected){
-      setStatus('<span class="ok">✅ Conectado!</span>');
-      qrImg.style.display='none';
-      btn.disabled = true;
-      return;
-    }
-    if(st.status === 'qr'){
-      // pega o QR
-      const data = await json('/api/qr');
-      if(data && data.status === 'qr' && data.qr){
-        qrImg.src = data.qr;
-        qrImg.style.display = 'inline';
-        setStatus('Escaneie o QR no WhatsApp · expira a cada ~60s');
-      }
-    }else{
-      setStatus('Aguardando QR…');
-    }
-  }catch(e){
-    setStatus('<span class="warn">Erro de rede.</span>');
-  }
-}
-
-btn.addEventListener('click', async ()=>{
-  btn.disabled = true;
-  await ensureStarted();
-});
-
-(async ()=>{
-  // auto-start ao abrir
-  await ensureStarted();
-  btn.disabled = false;
-  // polling
-  setInterval(poll, 2000);
-  poll();
-})();
-</script>
-</body>
-</html>
-  `);
-});
-
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
