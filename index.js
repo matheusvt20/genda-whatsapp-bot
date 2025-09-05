@@ -1,7 +1,9 @@
-// index.js — Genda WhatsApp Bot (QR com espera, restart e diag)
+// index.js — Genda WhatsApp Bot (robusto: espera QR, restart, diag e wipe de credenciais)
 
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const P = require('pino');
 const QRCode = require('qrcode');
 const {
@@ -17,10 +19,12 @@ const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map(); // userId -> boolean
 
+const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || path.join('.', 'auth_info');
+
 async function startBot(userId) {
   if (sessions.get(userId)) return sessions.get(userId);
 
-  const authDir = `./auth_info/${userId}`;
+  const authDir = path.join(AUTH_BASE_DIR, userId);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`ℹ️ Baileys WA version: ${version.join('.')} (latest=${isLatest}) para ${userId}`);
@@ -98,7 +102,6 @@ app.use(cors(corsOptions));
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-// helper de resposta (inclui expiração do QR)
 function buildQrResponse(userId) {
   const connected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
@@ -144,11 +147,9 @@ app.get('/api/qr', async (req, res) => {
     }
   }
 
-  // tenta imediatamente
   let resp = buildQrResponse(userId);
   if (resp.status !== 'offline') return res.json(resp);
 
-  // espera ativa até 10s por um QR novo
   const waitUntil = Date.now() + 10_000;
   while (Date.now() < waitUntil) {
     await new Promise(r => setTimeout(r, 300));
@@ -205,9 +206,7 @@ app.post('/api/restart', async (req, res) => {
     if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
     const sock = sessions.get(userId);
-    if (sock && sock.ws && sock.ws.close) {
-      try { sock.ws.close(); } catch {}
-    }
+    try { sock?.ws?.close(); } catch {}
     sessions.delete(userId);
     connections.delete(userId);
     lastQr.delete(userId);
@@ -220,7 +219,30 @@ app.post('/api/restart', async (req, res) => {
   }
 });
 
-// 🔎 Diagnóstico simples
+// 🧹 Wipe de credenciais (apaga pasta auth_info/<userId>) — use se der 401 device_removed
+app.get('/api/wipe', async (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+  const dir = path.join(AUTH_BASE_DIR, userId);
+
+  // encerra sessão em memória
+  const sock = sessions.get(userId);
+  try { sock?.ws?.close(); } catch {}
+  sessions.delete(userId);
+  connections.delete(userId);
+  lastQr.delete(userId);
+
+  try {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+    return res.json({ ok: true, wiped: true, userId, dir });
+  } catch (e) {
+    console.error('wipe error', e);
+    return res.status(500).json({ ok: false, error: 'WIPE_FAILED' });
+  }
+});
+
+// 🩺 Diagnóstico simples
 app.get('/api/diag', (req, res) => {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
@@ -239,17 +261,22 @@ app.get('/api/diag', (req, res) => {
     hasQr: !!qrInfo,
     qrAgeSec: ageSec,
     qrExpiresInSec: qrInfo?.expires_in_seconds ?? null,
+    authBaseDir: AUTH_BASE_DIR,
   });
 });
 
-// Desconectar/resetar sessão (apaga credenciais em memória)
-app.get('/api/disconnect', (req, res) => {
+// Desconectar/resetar sessão (apaga só em memória; faz logout se possível)
+app.get('/api/disconnect', async (req, res) => {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
   const sock = sessions.get(userId);
   if (sock) {
-    try { sock.logout(); } catch (_) {}
+    try {
+      // alguns estados lançam erro ao dar logout; por isso o try/catch + fallback
+      await Promise.resolve(sock.logout?.()).catch(() => {});
+    } catch (_) {}
+    try { sock?.ws?.close(); } catch {}
     sessions.delete(userId);
     connections.delete(userId);
     lastQr.delete(userId);
