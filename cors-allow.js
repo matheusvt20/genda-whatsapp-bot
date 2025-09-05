@@ -1,4 +1,5 @@
-// cors-allow.js — helper de CORS
+// cors-allow.js
+// Lógica de "origin permitido" extraída para facilitar testes
 
 function getAllowedFromEnv() {
   return (process.env.ALLOWED_ORIGINS || '')
@@ -7,29 +8,32 @@ function getAllowedFromEnv() {
     .filter(Boolean);
 }
 
-// Domínios padrão permitidos
 const defaultOrigins = [
+  // testes locais
   'http://localhost:3000',
   'http://localhost:5173',
   'https://localhost:3000',
+
+  // domínio da aplicação
   'https://usegenda.com',
   'https://www.usegenda.com',
+
   // Lovable
   /\.lovable\.dev$/,
   /\.lovable\.app$/,
-  // Render (seu domínio *.onrender.com)
+
+  // Render
   /\.onrender\.com$/,
 ];
 
 function isOriginAllowed(origin) {
-  // Sem Origin (ex.: curl/healthz) -> permite
-  if (!origin) return true;
+  if (!origin) return true;          // ex.: curl/healthz
+  if (origin === 'null') return true; // file:// (HTML local)
+  if (origin.startsWith('file://')) return true;
 
-  // Lista vinda do ambiente
   const allowedFromEnv = getAllowedFromEnv();
   if (allowedFromEnv.includes(origin)) return true;
 
-  // Lista padrão (strings exatas ou regex)
   return defaultOrigins.some((o) =>
     o instanceof RegExp ? o.test(origin) : o === origin
   );
