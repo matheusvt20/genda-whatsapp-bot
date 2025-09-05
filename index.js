@@ -1,4 +1,4 @@
-// index.js — Genda WhatsApp Bot (robusto: espera QR, restart, diag e wipe de credenciais)
+// index.js — Genda WhatsApp Bot (QR UI incluído)
 
 const express = require('express');
 const cors = require('cors');
@@ -120,7 +120,7 @@ function buildQrResponse(userId) {
       status: 'qr',
       connected: false,
       qr: qrInfo.qr_base64,
-      qr_base64: qrInfo.qr_base64,
+      qr_base64: qrInfo.qr_base64,  // importante para exibir a imagem
       expires_in_seconds: qrInfo.expires_in_seconds,
       timestamp: qrInfo.timestamp,
     };
@@ -265,6 +265,124 @@ app.get('/api/diag', (req, res) => {
   });
 });
 
+// 🌐 Página simples que exibe o QR automaticamente: GET /qr-ui?userId=<id>
+app.get('/qr-ui', (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('Cache-Control', 'no-store');
+  const uiUserId = String(req.query.userId || '').trim();
+
+  const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>QR WhatsApp - Genda</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;flex-direction:column;align-items:center;gap:16px;padding:24px}
+  header{display:flex;gap:8px;align-items:center}
+  input,button{font-size:16px;padding:8px 12px}
+  img{width:300px;height:300px;image-rendering:pixelated;border:1px solid #ddd;border-radius:8px;background:#fff}
+  code{background:#f6f8fa;padding:2px 6px;border-radius:6px}
+  .muted{color:#666}
+</style>
+</head>
+<body>
+  <h1>QR Code do WhatsApp</h1>
+
+  <header>
+    <label>userId:</label>
+    <input id="uid" value="${uiUserId || 'matheus'}" placeholder="seu userId" />
+    <button id="go">Abrir</button>
+    <button id="restart">Reiniciar sessão</button>
+    <button id="wipe">Wipe credenciais</button>
+  </header>
+
+  <div id="status" class="muted">Carregando...</div>
+  <img id="qr" alt="QR Code" />
+
+<script>
+const $ = (id) => document.getElementById(id);
+const uidInput = $("uid");
+const statusEl = $("status");
+const img = $("qr");
+
+$("go").onclick = () => {
+  const v = uidInput.value.trim();
+  if (!v) return alert("Informe um userId");
+  location.search = "?userId=" + encodeURIComponent(v);
+};
+
+$("restart").onclick = async () => {
+  const v = uidInput.value.trim();
+  if (!v) return alert("Informe um userId");
+  statusEl.textContent = "Reiniciando sessão...";
+  try {
+    await fetch("/api/restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: v })
+    });
+    setTimeout(loadLoop, 400);
+  } catch {}
+};
+
+$("wipe").onclick = async () => {
+  const v = uidInput.value.trim();
+  if (!v) return alert("Informe um userId");
+  statusEl.textContent = "Limpando credenciais...";
+  try {
+    await fetch("/api/wipe?userId=" + encodeURIComponent(v));
+    setTimeout(loadLoop, 400);
+  } catch {}
+};
+
+async function fetchJson(url, opts) {
+  const res = await fetch(url, opts);
+  try { return await res.json(); } catch { return {}; }
+}
+
+async function loadOnce() {
+  const userId = uidInput.value.trim();
+  if (!userId) {
+    statusEl.textContent = "Informe um userId e clique em Abrir.";
+    return;
+  }
+  const qrData = await fetchJson("/api/qr?userId=" + encodeURIComponent(userId));
+  if (qrData.status === "qr" && qrData.qr_base64) {
+    img.src = qrData.qr_base64;
+    img.style.display = "";
+    statusEl.textContent = "Escaneie: WhatsApp → Aparelhos conectados → Conectar aparelho.";
+    return;
+  }
+  if (qrData.status === "connected") {
+    img.style.display = "none";
+    statusEl.textContent = "Conectado ✅";
+    return;
+  }
+  statusEl.textContent = "Aguardando QR...";
+}
+
+async function loadLoop() {
+  await loadOnce();
+  const userId = uidInput.value.trim();
+  if (!userId) return;
+  const st = await fetchJson("/api/status?userId=" + encodeURIComponent(userId));
+  if (st.connected) {
+    img.style.display = "none";
+    statusEl.textContent = "Conectado ✅";
+  } else {
+    setTimeout(loadLoop, 1200);
+  }
+}
+
+loadLoop();
+</script>
+</body>
+</html>`;
+
+  res.send(html);
+});
+
 // Desconectar/resetar sessão (apaga só em memória; faz logout se possível)
 app.get('/api/disconnect', async (req, res) => {
   const userId = req.query.userId;
@@ -273,7 +391,6 @@ app.get('/api/disconnect', async (req, res) => {
   const sock = sessions.get(userId);
   if (sock) {
     try {
-      // alguns estados lançam erro ao dar logout; por isso o try/catch + fallback
       await Promise.resolve(sock.logout?.()).catch(() => {});
     } catch (_) {}
     try { sock?.ws?.close(); } catch {}
