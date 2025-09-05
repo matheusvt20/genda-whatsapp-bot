@@ -1,4 +1,4 @@
-// index.js — Genda WhatsApp Bot (com UI, CORS ajustado e rotas de manutenção)
+// index.js — Genda WhatsApp Bot (com UI, CORS ajustado, manutenção e QR PNG)
 
 const express = require('express');
 const cors = require('cors');
@@ -130,7 +130,7 @@ function buildQrResponse(userId) {
   return { ok: false, status: 'offline', connected: false };
 }
 
-// 🔗 /api/qr
+// 🔗 /api/qr (JSON com base64)
 app.get('/api/qr', async (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -159,6 +159,62 @@ app.get('/api/qr', async (req, res) => {
   }
 
   return res.json(resp);
+});
+
+// 🔗 /api/qr.png (imagem PNG direta)
+app.get('/api/qr.png', async (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+  if (!sessions.get(userId)) {
+    try {
+      await startBot(userId);
+    } catch (e) {
+      console.error('Erro ao iniciar sessão em /api/qr.png:', e);
+      return res.status(500).json({ ok: false, error: 'START_FAILED' });
+    }
+  }
+
+  function get() {
+    const connected = !!connections.get(userId);
+    const qrInfo = lastQr.get(userId);
+    if (connected) return { status: 'connected' };
+    if (qrInfo) {
+      const ttl = Number(qrInfo.expires_in_seconds ?? 60);
+      const ageSec = Math.floor((Date.now() - Date.parse(qrInfo.timestamp)) / 1000);
+      if (Number.isFinite(ttl) && ageSec >= ttl) {
+        lastQr.delete(userId);
+        return { status: 'expired' };
+      }
+      return { status: 'qr', dataUrl: qrInfo.qr_base64 };
+    }
+    return { status: 'offline' };
+  }
+
+  let r = get();
+  if (r.status === 'qr' && r.dataUrl) {
+    const b64 = r.dataUrl.replace(/^data:image\/png;base64,/, '');
+    const buf = Buffer.from(b64, 'base64');
+    res.set('Content-Type', 'image/png');
+    return res.send(buf);
+  }
+
+  const waitUntil = Date.now() + 10_000;
+  while (Date.now() < waitUntil) {
+    await new Promise(s => setTimeout(s, 300));
+    r = get();
+    if (r.status === 'qr' && r.dataUrl) {
+      const b64 = r.dataUrl.replace(/^data:image\/png;base64,/, '');
+      const buf = Buffer.from(b64, 'base64');
+      res.set('Content-Type', 'image/png');
+      return res.send(buf);
+    }
+  }
+
+  return res.status(425).json({ ok: false, status: get().status || 'offline' });
 });
 
 // Status da sessão
@@ -251,7 +307,6 @@ app.post('/api/wipe', async (req, res) => {
       console.warn('Falha ao remover auth dir (pode não existir):', e?.message);
     }
 
-    // já reinicia automaticamente
     startBot(userId).catch(console.error);
     return res.json({ ok: true, wiped: true });
   } catch (e) {
