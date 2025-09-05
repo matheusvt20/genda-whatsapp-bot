@@ -3,6 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const P = require('pino');
 const QRCode = require('qrcode');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
 const {
   default: makeWASocket,
   DisconnectReason,
@@ -140,39 +143,6 @@ app.get('/api/qr', (req, res) => {
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
-// NOVO: página HTML com refresh automático
-app.get('/api/qr/html', (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  const userId = req.query.userId;
-  if (!userId) {
-    return res.send('<h3 style="color:red">❌ userId obrigatório</h3>');
-  }
-
-  const connected = !!connections.get(userId);
-  const qrInfo = lastQr.get(userId);
-
-  if (connected) {
-    return res.send('<h2 style="color:green">✅ Conectado com sucesso!</h2>');
-  }
-
-  if (qrInfo) {
-    return res.send(`
-      <html>
-        <head>
-          <meta http-equiv="refresh" content="10">
-        </head>
-        <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-          <h2>📲 Escaneie o QR Code abaixo com seu WhatsApp</h2>
-          <img src="${qrInfo.qr_base64}" alt="QR Code" />
-          <p>⚡ QR expira em ~60s. Esta página atualiza a cada 10s automaticamente.</p>
-        </body>
-      </html>
-    `);
-  }
-
-  return res.send('<h3 style="color:red">❌ Nenhum QR disponível. Tente /api/connect primeiro.</h3>');
-});
-
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -180,6 +150,34 @@ app.get('/api/status', (req, res) => {
   const connected = !!connections.get(userId);
   const status = connected ? 'connected' : (lastQr.has(userId) ? 'qr' : 'offline');
   res.json({ ok: true, status, connected, timestamp: new Date().toISOString() });
+});
+
+// 🔌 Disconnect endpoint
+app.get('/api/disconnect', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+  try {
+    const sock = sessions.get(userId);
+    if (sock) {
+      await sock.ws.close();
+      sessions.delete(userId);
+      connections.delete(userId);
+      lastQr.delete(userId);
+    }
+
+    const authDir = path.join(__dirname, 'auth_info', userId);
+    if (fs.existsSync(authDir)) {
+      await fsp.rm(authDir, { recursive: true, force: true });
+      console.log(`🗑️ Sessão apagada para ${userId}`);
+    }
+
+    return res.json({ ok: true, disconnected: true, userId });
+  } catch (err) {
+    console.error('Erro /api/disconnect:', err);
+    return res.status(500).json({ ok: false, error: 'DISCONNECT_FAILED' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
