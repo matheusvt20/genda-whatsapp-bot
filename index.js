@@ -27,8 +27,8 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    // 🔹 Simula um iPhone real com Safari
-    browser: ['Safari', 'iPhone', '16.6.1'],
+    // 🔹 Simula um Android com Chrome
+    browser: ['Chrome', 'Android', '14.0'],
     // 🔹 Mais tolerância no login
     connectTimeoutMs: 120_000,
     keepAliveIntervalMs: 15_000,
