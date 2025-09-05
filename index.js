@@ -14,6 +14,9 @@ const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map(); // userId -> boolean
 
+// 🔒 userId fixo para teste
+const FIXED_USER_ID = "matheus";
+
 async function startBot(userId) {
   if (sessions.get(userId)) return sessions.get(userId);
 
@@ -27,14 +30,11 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    // 🔹 Simula um Android com Chrome
-    browser: ['Chrome', 'Android', '14.0'],
-    // 🔹 Mais tolerância no login
-    connectTimeoutMs: 120_000,
-    keepAliveIntervalMs: 15_000,
-    // 🔹 Deixa mais parecido com login oficial
-    syncFullHistory: true,
+    browser: ['Chrome', 'Windows', '10.0'],
     markOnlineOnConnect: false,
+    syncFullHistory: false,
+    connectTimeoutMs: 60_000,
+    keepAliveIntervalMs: 15_000,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -71,13 +71,8 @@ async function startBot(userId) {
     }
   });
 
-  // Logs úteis pra ver progresso do login
-  sock.ev.on('auth-state.update', (s) =>
-    console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando')
-  );
-  sock.ev.on('messaging-history.set', () =>
-    console.log(`🗂️ history set ${userId}`)
-  );
+  sock.ev.on('auth-state.update', (s) => console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando'));
+  sock.ev.on('messaging-history.set', () => console.log(`🗂️ history set ${userId}`));
 
   sessions.set(userId, sock);
   return sock;
@@ -100,7 +95,7 @@ const defaultOrigins = [
 ];
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // Origin:null (apps/preview)
+    if (!origin) return cb(null, true);
     if (allowedFromEnv.includes(origin)) return cb(null, true);
     const ok = defaultOrigins.some(o => (o instanceof RegExp ? o.test(origin) : o === origin));
     return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`));
@@ -109,26 +104,24 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
+// Rotas
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
-app.get('/api/connect', async (req, res) => {
+app.get('/api/connect', async (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
   try {
-    await startBot(userId);
-    return res.json({ ok: true, started: true, userId });
+    await startBot(FIXED_USER_ID);
+    return res.json({ ok: true, started: true, userId: FIXED_USER_ID });
   } catch (e) {
     console.error('Erro /api/connect:', e);
     return res.status(500).json({ ok: false, error: 'CONNECT_FAILED' });
   }
 });
 
-app.get('/api/qr', (req, res) => {
+app.get('/api/qr', (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+  const userId = FIXED_USER_ID;
 
   const connected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
@@ -148,13 +141,30 @@ app.get('/api/qr', (req, res) => {
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+  const userId = FIXED_USER_ID;
   const connected = !!connections.get(userId);
   const status = connected ? 'connected' : (lastQr.has(userId) ? 'qr' : 'offline');
-  res.json({ ok: true, status, connected, timestamp: new Date().toISOString() });
+  res.json({ ok: true, status, connected, userId, timestamp: new Date().toISOString() });
+});
+
+app.get('/api/disconnect', (_req, res) => {
+  const userId = FIXED_USER_ID;
+  const sock = sessions.get(userId);
+  if (sock) {
+    try {
+      sock.logout();
+      sessions.delete(userId);
+      lastQr.delete(userId);
+      connections.delete(userId);
+      return res.json({ ok: true, disconnected: true, userId });
+    } catch (e) {
+      console.error('Erro ao desconectar:', e);
+      return res.status(500).json({ ok: false, error: 'DISCONNECT_FAILED' });
+    }
+  }
+  return res.json({ ok: false, error: 'NO_ACTIVE_SESSION' });
 });
 
 const PORT = process.env.PORT || 3000;
