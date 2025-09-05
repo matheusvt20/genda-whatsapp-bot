@@ -68,12 +68,8 @@ async function startBot(userId) {
     }
   });
 
-  sock.ev.on('auth-state.update', (s) =>
-    console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando')
-  );
-  sock.ev.on('messaging-history.set', () =>
-    console.log(`🗂️ history set ${userId}`)
-  );
+  sock.ev.on('auth-state.update', (s) => console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando'));
+  sock.ev.on('messaging-history.set', () => console.log(`🗂️ history set ${userId}`));
 
   sessions.set(userId, sock);
   return sock;
@@ -144,23 +140,37 @@ app.get('/api/qr', (req, res) => {
   return res.json({ ok: false, status: 'offline', connected: false });
 });
 
-// Novo endpoint que mostra QR em HTML
+// NOVO: página HTML com refresh automático
 app.get('/api/qr/html', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
-  if (!userId) return res.send('<h1>❌ Informe userId</h1>');
+  if (!userId) {
+    return res.send('<h3 style="color:red">❌ userId obrigatório</h3>');
+  }
 
+  const connected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
-  if (!qrInfo) return res.send('<h1>❌ Nenhum QR disponível. Tente /api/connect primeiro.</h1>');
 
-  res.send(`
-    <html>
-      <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-        <h2>📲 Escaneie o QR para conectar</h2>
-        <img src="${qrInfo.qr_base64}" />
-        <p>Válido até: ${qrInfo.timestamp}</p>
-      </body>
-    </html>
-  `);
+  if (connected) {
+    return res.send('<h2 style="color:green">✅ Conectado com sucesso!</h2>');
+  }
+
+  if (qrInfo) {
+    return res.send(`
+      <html>
+        <head>
+          <meta http-equiv="refresh" content="10">
+        </head>
+        <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+          <h2>📲 Escaneie o QR Code abaixo com seu WhatsApp</h2>
+          <img src="${qrInfo.qr_base64}" alt="QR Code" />
+          <p>⚡ QR expira em ~60s. Esta página atualiza a cada 10s automaticamente.</p>
+        </body>
+      </html>
+    `);
+  }
+
+  return res.send('<h3 style="color:red">❌ Nenhum QR disponível. Tente /api/connect primeiro.</h3>');
 });
 
 app.get('/api/status', (req, res) => {
