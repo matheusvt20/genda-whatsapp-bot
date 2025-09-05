@@ -40,6 +40,7 @@ async function startBot(userId) {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
+
     if (qr) {
       QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' })
         .then((dataUrl) => {
@@ -71,7 +72,9 @@ async function startBot(userId) {
   });
 
   // Logs úteis pra ver progresso do login
-  sock.ev.on('auth-state.update', (s) => console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando'));
+  sock.ev.on('auth-state.update', (s) =>
+    console.log(`🔐 auth-state ${userId}:`, s?.credsRegistered ? 'credsRegistered' : 'carregando'),
+  );
   sock.ev.on('messaging-history.set', () => console.log(`🗂️ history set ${userId}`));
 
   sessions.set(userId, sock);
@@ -83,7 +86,9 @@ app.use(express.json());
 
 // CORS
 const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const defaultOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
@@ -97,7 +102,7 @@ const corsOptions = {
   origin(origin, cb) {
     if (!origin) return cb(null, true); // Origin:null (apps/preview)
     if (allowedFromEnv.includes(origin)) return cb(null, true);
-    const ok = defaultOrigins.some(o => (o instanceof RegExp ? o.test(origin) : o === origin));
+    const ok = defaultOrigins.some((o) => (o instanceof RegExp ? o.test(origin) : o === origin));
     return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`));
   },
   credentials: true,
@@ -141,6 +146,28 @@ app.get('/api/qr', (req, res) => {
     });
   }
   return res.json({ ok: false, status: 'offline', connected: false });
+});
+
+/**
+ * Novo endpoint: retorna a imagem PNG do QR diretamente.
+ * Ex.: GET /api/qr-image?userId=matheus
+ */
+app.get('/api/qr-image', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).send('MISSING_USER_ID');
+
+  const info = lastQr.get(userId);
+  if (!info) return res.status(404).send('QR_NOT_READY');
+
+  try {
+    const b64 = String(info.qr_base64 || '').replace(/^data:image\/png;base64,/, '');
+    const buf = Buffer.from(b64, 'base64');
+    res.type('png').send(buf);
+  } catch (err) {
+    console.error('Erro ao enviar QR PNG:', err);
+    res.status(500).send('QR_DECODE_ERROR');
+  }
 });
 
 app.get('/api/status', (req, res) => {
