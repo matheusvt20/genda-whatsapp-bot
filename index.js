@@ -19,16 +19,26 @@ const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map(); // userId -> boolean
 
-// ✅ ALTERADO: default agora é '/data'
+// ✅ Diretório base de autenticação: /data (disco persistente do Render)
 const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || '/data';
+
+// ✅ Garante que o diretório base existe (evita falha silenciosa ao salvar creds)
+try { fs.mkdirSync(AUTH_BASE_DIR, { recursive: true }); } catch (e) {
+  console.warn('WARN: não foi possível criar AUTH_BASE_DIR:', e?.message);
+}
 
 async function startBot(userId) {
   if (sessions.get(userId)) return sessions.get(userId);
 
   const authDir = path.join(AUTH_BASE_DIR, userId);
+  // ✅ Garante que a pasta da sessão existe (ex.: /data/matheus)
+  try { fs.mkdirSync(authDir, { recursive: true }); } catch (e) {
+    console.warn('WARN: não foi possível criar authDir:', authDir, e?.message);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
-  console.log(`ℹ️ Baileys WA version: ${version.join('.')} (latest=${isLatest}) para ${userId}`);
+  console.log(`ℹ️ Baileys WA version: ${version.join('.')} (latest=${isLatest}) para ${userId} | authDir=${authDir}`);
 
   const sock = makeWASocket({
     version,
@@ -86,7 +96,7 @@ async function startBot(userId) {
 const app = express();
 app.use(express.json());
 
-// CORS — agora aceita file:// (Origin null) e regex de onrender.com
+// CORS — aceita file:// (Origin null) e regex de onrender.com
 const corsOptions = {
   origin(origin, cb) {
     if (!origin || origin.startsWith('file://')) {
