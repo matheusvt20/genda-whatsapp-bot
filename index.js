@@ -19,7 +19,8 @@ const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map(); // userId -> boolean
 
-const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || path.join('.', 'auth_info');
+// ✅ ALTERADO: default agora é '/data'
+const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || '/data';
 
 async function startBot(userId) {
   if (sessions.get(userId)) return sessions.get(userId);
