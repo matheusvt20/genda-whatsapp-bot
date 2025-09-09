@@ -1,4 +1,4 @@
-// index.js — Genda WhatsApp Bot (com UI, CORS ajustado, manutenção e QR PNG)
+// index.js — Genda WhatsApp Bot (com UI, CORS ajustado, manutenção, QR PNG e fix reconnect)
 
 const express = require('express');
 const cors = require('cors');
@@ -83,7 +83,10 @@ async function startBot(userId) {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       connections.set(userId, false);
       console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — loggedOut? ${loggedOut}`);
+
+      // ✅ FIX: se não for logout, remova a sessão e recrie o socket
       if (!loggedOut) {
+        try { sessions.delete(userId); } catch {}
         setTimeout(() => startBot(userId).catch(console.error), 2000);
       }
     }
@@ -341,7 +344,7 @@ app.post('/api/restart', async (req, res) => {
   }
 });
 
-// ====== FIM DAS ROTAS DE MANUTENÇÃO ======
+// ====== FIM ======
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
