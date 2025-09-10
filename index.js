@@ -44,7 +44,8 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    browser: ['Chrome', 'Windows', '10.0'],
+    // 🔧 UA "mais web" para reduzir erros 515 de stream
+    browser: ['Ubuntu', 'Chrome', '20.04'],
     markOnlineOnConnect: false,
     syncFullHistory: false,
     connectTimeoutMs: 60_000,
@@ -80,13 +81,16 @@ async function startBot(userId) {
       const boom = lastDisconnect?.error;
       const statusCode = boom?.output?.statusCode || boom?.data?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+
       connections.set(userId, false);
       console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — loggedOut? ${loggedOut}`);
 
-      // ♻️ Reconecta somente o mesmo userId (sem criar sessões zumbis)
+      // ↪️ Se NÃO for logout, removemos a sessão e tentamos reconectar
       if (!loggedOut) {
+        try { sessions.delete(userId); } catch {}
         setTimeout(() => startBot(userId).catch(console.error), 2000);
       } else {
+        // Logout: limpa somente a sessão (mantém diretório; wipe apaga)
         sessions.delete(userId);
       }
     }
@@ -231,7 +235,7 @@ app.get('/api/qr.png', async (req, res) => {
   return res.status(425).json({ ok: false, status: get().status || 'offline' });
 });
 
-// Status da sessão (corrigido com "reconnecting")
+// Status da sessão (inclui "reconnecting")
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -316,7 +320,7 @@ app.post('/api/disconnect', async (req, res) => {
   }
 });
 
-// 🧹 Wipe total
+// 🧹 Wipe total: apaga credenciais e força novo QR
 app.post('/api/wipe', async (req, res) => {
   try {
     const { userId } = req.body || {};
@@ -328,7 +332,7 @@ app.post('/api/wipe', async (req, res) => {
       fs.rmSync(dir, { recursive: true, force: true });
       console.log('🗑️ Auth dir removido:', dir);
     } catch (e) {
-      console.warn('Falha ao remover auth dir:', e?.message);
+      console.warn('Falha ao remover auth dir (pode não existir):', e?.message);
     }
 
     startBot(userId).catch(console.error);
@@ -339,7 +343,7 @@ app.post('/api/wipe', async (req, res) => {
   }
 });
 
-// ♻️ Restart
+// ♻️ Restart: fecha e reabre a sessão (mantém credenciais)
 app.post('/api/restart', async (req, res) => {
   try {
     const { userId } = req.body || {};
