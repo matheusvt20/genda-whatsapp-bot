@@ -21,8 +21,6 @@ const connections = new Map(); // userId -> boolean
 
 // ✅ Diretório base de autenticação: /data (disco persistente do Render)
 const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || '/data';
-
-// ✅ Garante que o diretório base existe (evita falha silenciosa ao salvar creds)
 try { fs.mkdirSync(AUTH_BASE_DIR, { recursive: true }); } catch (e) {
   console.warn('WARN: não foi possível criar AUTH_BASE_DIR:', e?.message);
 }
@@ -44,8 +42,7 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    // 🔧 UA "mais web" para reduzir erros 515 de stream
-    browser: ['Ubuntu', 'Chrome', '20.04'],
+    browser: ['Ubuntu', 'Chrome', '20.04'], // ⚡ força WebBrowser
     markOnlineOnConnect: false,
     syncFullHistory: false,
     connectTimeoutMs: 60_000,
@@ -85,12 +82,17 @@ async function startBot(userId) {
       connections.set(userId, false);
       console.log(`🔌 Conexão encerrada ${userId} — statusCode: ${statusCode} — loggedOut? ${loggedOut}`);
 
-      // ↪️ Se NÃO for logout, removemos a sessão e tentamos reconectar
+      if (statusCode === 401) {
+        console.log(`⚠️ Sessão de ${userId} inválida (device removed). Limpando...`);
+        sessions.delete(userId);
+        lastQr.delete(userId);
+        return;
+      }
+
       if (!loggedOut) {
         try { sessions.delete(userId); } catch {}
         setTimeout(() => startBot(userId).catch(console.error), 2000);
       } else {
-        // Logout: limpa somente a sessão (mantém diretório; wipe apaga)
         sessions.delete(userId);
       }
     }
