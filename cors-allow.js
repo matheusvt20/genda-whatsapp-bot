@@ -21,13 +21,14 @@ const defaultOrigins = [
   // Lovable
   /\.lovable\.dev$/,
   /\.lovable\.app$/,
+  /\.lovableproject\.com$/,   // ✅ permite qualquer subdomínio .lovableproject.com
 
   // Render
   /\.onrender\.com$/,
 ];
 
 function isOriginAllowed(origin) {
-  if (!origin) return true;          // ex.: curl/healthz
+  if (!origin) return true;           // ex.: curl/healthz
   if (origin === 'null') return true; // file:// (HTML local)
   if (origin.startsWith('file://')) return true;
 
