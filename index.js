@@ -26,6 +26,17 @@ try { fs.mkdirSync(AUTH_BASE_DIR, { recursive: true }); } catch (e) {
 }
 
 // ==============================
+// Funções utilitárias
+// ==============================
+function isSocketAlive(sock) {
+  try {
+    return !!(sock?.ws && sock?.ws.readyState === 1);
+  } catch {
+    return false;
+  }
+}
+
+// ==============================
 // Função principal do bot
 // ==============================
 async function startBot(userId) {
@@ -33,11 +44,12 @@ async function startBot(userId) {
   if (sessions.get(userId)) {
     const sock = sessions.get(userId);
     const isConnected = connections.get(userId);
-    if (!isConnected) {
-      console.log(`♻️ Sessão anterior de ${userId} estava desconectada. Reiniciando...`);
+    if (!isConnected || !isSocketAlive(sock)) {
+      console.log(`♻️ Sessão anterior de ${userId} estava desconectada ou socket morto. Reiniciando...`);
       try {
         sessions.delete(userId);
         lastQr.delete(userId);
+        connections.set(userId, false);
       } catch {}
     } else {
       return sock; // mantém sessão ativa
@@ -271,14 +283,16 @@ app.get('/api/qr.png', async (req, res) => {
 });
 
 // ==============================
-// /api/status
+// /api/status (corrigido com socket check)
 // ==============================
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
-  const isConnected = connections.get(userId) === true;
+  const sock = sessions.get(userId);
+  const sockAlive = isSocketAlive(sock);
+  const isConnected = connections.get(userId) === true && sockAlive;
   const hasQr = lastQr.has(userId);
   let status = 'offline';
 
@@ -286,11 +300,17 @@ app.get('/api/status', (req, res) => {
     status = 'connected';
   } else if (hasQr) {
     status = 'qr';
-  } else if (sessions.get(userId)) {
+  } else if (sock) {
     status = 'reconnecting';
   }
 
-  res.json({ ok: true, status, connected: isConnected, timestamp: new Date().toISOString() });
+  res.json({
+    ok: true,
+    status,
+    connected: isConnected,
+    alive: sockAlive,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ==============================
@@ -305,7 +325,7 @@ app.post('/api/send', async (req, res) => {
 
     const sock = sessions.get(userId);
     const isConnected = connections.get(userId);
-    if (!sock || !isConnected) {
+    if (!sock || !isConnected || !isSocketAlive(sock)) {
       return res.status(400).json({ ok: false, error: 'NOT_CONNECTED', hint: 'Conecte via /api/qr primeiro' });
     }
 
