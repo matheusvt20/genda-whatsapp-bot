@@ -25,8 +25,24 @@ try { fs.mkdirSync(AUTH_BASE_DIR, { recursive: true }); } catch (e) {
   console.warn('WARN: não foi possível criar AUTH_BASE_DIR:', e?.message);
 }
 
+// ==============================
+// Função principal do bot
+// ==============================
 async function startBot(userId) {
-  if (sessions.get(userId)) return sessions.get(userId);
+  // --- proteção contra sessão travada ---
+  if (sessions.get(userId)) {
+    const sock = sessions.get(userId);
+    const isConnected = connections.get(userId);
+    if (!isConnected) {
+      console.log(`♻️ Sessão anterior de ${userId} estava desconectada. Reiniciando...`);
+      try {
+        sessions.delete(userId);
+        lastQr.delete(userId);
+      } catch {}
+    } else {
+      return sock; // mantém sessão ativa
+    }
+  }
 
   const authDir = path.join(AUTH_BASE_DIR, userId);
   try { fs.mkdirSync(authDir, { recursive: true }); } catch (e) {
@@ -42,7 +58,7 @@ async function startBot(userId) {
     logger: P({ level: 'info' }),
     printQRInTerminal: false,
     auth: state,
-    browser: ['Ubuntu', 'Chrome', '20.04'], // ⚡ força WebBrowser
+    browser: ['Genda', 'Chrome', '10.0'],
     markOnlineOnConnect: false,
     syncFullHistory: false,
     connectTimeoutMs: 60_000,
@@ -91,6 +107,7 @@ async function startBot(userId) {
 
       if (!loggedOut) {
         try { sessions.delete(userId); } catch {}
+        console.log(`🔁 Forçando restart automático da sessão de ${userId}`);
         setTimeout(() => startBot(userId).catch(console.error), 2000);
       } else {
         sessions.delete(userId);
@@ -102,6 +119,9 @@ async function startBot(userId) {
   return sock;
 }
 
+// ==============================
+// Express App + CORS
+// ==============================
 const app = express();
 app.use(express.json());
 
@@ -119,7 +139,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Rota inicial
+// ==============================
+// Rotas principais
+// ==============================
 app.get('/', (_req, res) => res.send('Genda WhatsApp Bot ✅ Online'));
 app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
@@ -150,13 +172,22 @@ function buildQrResponse(userId) {
   return { ok: false, status: 'offline', connected: false };
 }
 
-// 🔗 /api/qr (JSON com base64)
+// ==============================
+// /api/qr (JSON com base64)
+// ==============================
 app.get('/api/qr', async (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
 
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
+
+  // --- limpeza de sessão travada antes de iniciar ---
+  if (sessions.get(userId) && !connections.get(userId)) {
+    console.log(`🧹 Limpando sessão travada antes de reiniciar ${userId}`);
+    sessions.delete(userId);
+    lastQr.delete(userId);
+  }
 
   if (!sessions.get(userId)) {
     console.log(`⚡ Nenhuma sessão ativa para ${userId}, iniciando...`);
@@ -181,7 +212,9 @@ app.get('/api/qr', async (req, res) => {
   return res.json(resp);
 });
 
-// 🔗 /api/qr.png (imagem PNG direta)
+// ==============================
+// /api/qr.png (imagem PNG direta)
+// ==============================
 app.get('/api/qr.png', async (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -237,7 +270,9 @@ app.get('/api/qr.png', async (req, res) => {
   return res.status(425).json({ ok: false, status: get().status || 'offline' });
 });
 
-// Status da sessão (inclui "reconnecting")
+// ==============================
+// /api/status
+// ==============================
 app.get('/api/status', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
@@ -258,7 +293,9 @@ app.get('/api/status', (req, res) => {
   res.json({ ok: true, status, connected: isConnected, timestamp: new Date().toISOString() });
 });
 
-// ▶️ Envio de mensagem
+// ==============================
+// /api/send
+// ==============================
 app.post('/api/send', async (req, res) => {
   try {
     const { userId, to, text } = req.body || {};
@@ -286,7 +323,9 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// ====== ROTAS DE MANUTENÇÃO ======
+// ==============================
+// Rotas de manutenção
+// ==============================
 function getAuthDirFor(userId) {
   return path.join(AUTH_BASE_DIR, userId);
 }
@@ -360,6 +399,8 @@ app.post('/api/restart', async (req, res) => {
   }
 });
 
-// ====== FIM ======
+// ==============================
+// Start do servidor
+// ==============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
