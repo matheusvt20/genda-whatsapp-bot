@@ -14,6 +14,32 @@ const {
 
 const { isOriginAllowed } = require('./cors-allow'); // sua whitelist CORS
 
+async function notifyConnectionStatus(userId, status) {
+  const webhookUrl = process.env.SUPABASE_CONNECTION_WEBHOOK;
+  const botSignature = process.env.BOT_SIGNATURE;
+
+  if (!webhookUrl || !botSignature) return;
+
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bot-signature': botSignature,
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        status,
+        timestamp: new Date().toISOString(),
+      }),
+    });
+
+    console.log(`📡 Status ${status} notificado para ${userId}: ${res.status}`);
+  } catch (err) {
+    console.error(`❌ Erro ao notificar status ${status} para ${userId}:`, err.message);
+  }
+}
+
 // In-memory maps (process-lifetime). Persistência real está nas credenciais em disco.
 const sessions = new Map();    // userId -> sock
 const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
@@ -72,6 +98,7 @@ async function startBot(userId) {
       connections.set(userId, true);
       lastQr.delete(userId);
       console.log(`✅ ${userId} CONECTADO!`);
+      void notifyConnectionStatus(userId, 'connected');
     }
 
     if (connection === 'close') {
@@ -84,6 +111,7 @@ async function startBot(userId) {
 
       // Se foi logout intencional pelo WhatsApp -> remover credenciais
       if (statusCode === 401 || loggedOut) {
+        void notifyConnectionStatus(userId, 'disconnected');
         // delete session files if logged out / device removed
         try {
           const dir = path.join(AUTH_BASE_DIR, userId);
@@ -98,6 +126,7 @@ async function startBot(userId) {
       }
 
       // caso não seja logout, tenta reconectar automaticamente após um pequeno delay
+      void notifyConnectionStatus(userId, 'waiting');
       try { sessions.delete(userId); } catch (e) {}
       setTimeout(() => startBot(userId).catch(err => console.error('Erro restart startBot:', err)), 2000);
     }
