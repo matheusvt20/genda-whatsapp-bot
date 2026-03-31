@@ -159,6 +159,16 @@ app.get('/healthz', (_req, res) => res.json({ ok: true, timestamp: new Date().to
 
 // /api/qr -> retorna JSON com qr_base64
 app.get('/api/qr', async (req, res) => {
+  console.log(JSON.stringify({
+    event: '📡 REQUEST',
+    endpoint: '/api/qr',
+    timestamp: new Date().toISOString(),
+    userId: req.query.userId || req.body?.userId || 'não informado',
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress,
+    origin: req.headers['origin'] || 'não informado',
+    referer: req.headers['referer'] || 'não informado',
+    userAgent: req.headers['user-agent'] || 'não informado'
+  }));
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
 
@@ -187,6 +197,16 @@ app.get('/api/qr', async (req, res) => {
 
 // /api/qr.png -> retorna o PNG do QR
 app.get('/api/qr.png', async (req, res) => {
+  console.log(JSON.stringify({
+    event: '📡 REQUEST',
+    endpoint: '/api/qr.png',
+    timestamp: new Date().toISOString(),
+    userId: req.query.userId || req.body?.userId || 'não informado',
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress,
+    origin: req.headers['origin'] || 'não informado',
+    referer: req.headers['referer'] || 'não informado',
+    userAgent: req.headers['user-agent'] || 'não informado'
+  }));
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
 
@@ -241,6 +261,16 @@ app.get('/api/qr.png', async (req, res) => {
 
 // /api/status -> status simples
 app.get('/api/status', (req, res) => {
+  console.log(JSON.stringify({
+    event: '📡 REQUEST',
+    endpoint: '/api/status',
+    timestamp: new Date().toISOString(),
+    userId: req.query.userId || req.body?.userId || 'não informado',
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress,
+    origin: req.headers['origin'] || 'não informado',
+    referer: req.headers['referer'] || 'não informado',
+    userAgent: req.headers['user-agent'] || 'não informado'
+  }));
   res.set('Cache-Control', 'no-store');
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
