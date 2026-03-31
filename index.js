@@ -305,13 +305,24 @@ app.get('/api/status', (req, res) => {
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
   const isConnected = connections.get(userId) === true;
-  const hasQr = lastQr.has(userId);
+  const qrInfo = lastQr.get(userId);
+  const hasQr = !!qrInfo;
   let status = 'offline';
   if (isConnected) status = 'connected';
   else if (hasQr) status = 'qr';
   else if (sessions.get(userId)) status = 'reconnecting';
 
-  res.json({ ok: true, status, connected: isConnected, timestamp: new Date().toISOString() });
+  res.json({
+    ok: true,
+    status,
+    connected: isConnected,
+    timestamp: new Date().toISOString(),
+    ...(qrInfo && !isConnected ? {
+      qr_base64: qrInfo.qr_base64,
+      expires_in_seconds: qrInfo.expires_in_seconds,
+      qr_timestamp: qrInfo.timestamp,
+    } : {}),
+  });
 });
 
 // /api/send -> envia mensagem (usa sessão do userId)
