@@ -14,7 +14,13 @@ const {
 
 const { isOriginAllowed } = require('./cors-allow'); // sua whitelist CORS
 
-async function notifyConnectionStatus(userId, status) {
+function extractPhoneNumber(sock) {
+  const rawJid = sock?.user?.id || '';
+  const phoneNumber = rawJid.split('@')[0]?.split(':')[0] || null;
+  return phoneNumber || null;
+}
+
+async function notifyConnectionStatus(userId, status, phoneNumber = null) {
   const webhookUrl = process.env.SUPABASE_CONNECTION_WEBHOOK;
   const botSignature = process.env.BOT_SIGNATURE;
 
@@ -30,6 +36,7 @@ async function notifyConnectionStatus(userId, status) {
       body: JSON.stringify({
         user_id: userId,
         status,
+        phone_number: phoneNumber,
         timestamp: new Date().toISOString(),
       }),
     });
@@ -97,8 +104,9 @@ async function startBot(userId) {
     if (connection === 'open') {
       connections.set(userId, true);
       lastQr.delete(userId);
+      const phoneNumber = extractPhoneNumber(sock);
       console.log(`✅ ${userId} CONECTADO!`);
-      void notifyConnectionStatus(userId, 'connected');
+      void notifyConnectionStatus(userId, 'connected', phoneNumber);
     }
 
     if (connection === 'close') {
@@ -126,7 +134,7 @@ async function startBot(userId) {
       }
 
       // caso não seja logout, tenta reconectar automaticamente após um pequeno delay
-      void notifyConnectionStatus(userId, 'waiting');
+      void notifyConnectionStatus(userId, 'disconnected');
       try { sessions.delete(userId); } catch (e) {}
       setTimeout(() => startBot(userId).catch(err => console.error('Erro restart startBot:', err)), 2000);
     }
@@ -307,6 +315,8 @@ app.get('/api/status', (req, res) => {
   const isConnected = connections.get(userId) === true;
   const qrInfo = lastQr.get(userId);
   const hasQr = !!qrInfo;
+  const session = sessions.get(userId);
+  const phoneNumber = extractPhoneNumber(session);
   let status = 'offline';
   if (isConnected) status = 'connected';
   else if (hasQr) status = 'qr';
@@ -316,6 +326,7 @@ app.get('/api/status', (req, res) => {
     ok: true,
     status,
     connected: isConnected,
+    phone_number: phoneNumber,
     timestamp: new Date().toISOString(),
     ...(qrInfo && !isConnected ? {
       qr_base64: qrInfo.qr_base64,
@@ -425,3 +436,25 @@ app.post('/api/restart', async (req, res) => {
 // server listen
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
+
+// Auto-boot: reconecta todas as sessões salvas em disco
+(async () => {
+  try {
+    const entries = fs.readdirSync(AUTH_BASE_DIR, { withFileTypes: true });
+    const userIds = entries.filter(e => e.isDirectory()).map(e => e.name);
+    if (userIds.length === 0) {
+      console.log('ℹ️ Auto-boot: nenhuma sessão salva encontrada');
+      return;
+    }
+    console.log(`🔄 Auto-boot: encontradas ${userIds.length} sessão(ões): ${userIds.join(', ')}`);
+    await Promise.allSettled(
+      userIds.map(userId =>
+        startBot(userId)
+          .then(() => console.log(`✅ Auto-boot: ${userId} iniciado`))
+          .catch(err => console.error(`❌ Auto-boot: falha ao iniciar ${userId}:`, err?.message))
+      )
+    );
+  } catch (err) {
+    console.error('❌ Auto-boot: erro ao ler AUTH_BASE_DIR:', err?.message);
+  }
+})();
