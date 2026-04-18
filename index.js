@@ -355,8 +355,19 @@ app.post('/api/send', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'INVALID_NUMBER', hint: 'Use 55DDDNUMERO (só dígitos)' });
     }
     const jid = `${digits}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text });
-    return res.json({ ok: true, sent: true, to: jid });
+    const result = await sock.sendMessage(jid, { text });
+
+    return res.json({
+      ok: true,
+      sent: true,
+      to: jid,
+      messageId: result?.key?.id || null,
+      remoteJid: result?.key?.remoteJid || jid,
+      status: result?.status || null,
+      messageTimestamp: result?.messageTimestamp || null,
+      key: result?.key || null,
+      result,
+    });
   } catch (e) {
     console.error('send error', e);
     return res.status(500).json({ ok: false, error: 'SEND_FAILED' });
