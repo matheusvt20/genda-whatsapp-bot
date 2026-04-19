@@ -48,9 +48,10 @@ async function notifyConnectionStatus(userId, status, phoneNumber = null) {
 }
 
 // In-memory maps (process-lifetime). Persistência real está nas credenciais em disco.
-const sessions = new Map();    // userId -> sock
-const lastQr = new Map();      // userId -> { qr_base64, expires_in_seconds, timestamp }
-const connections = new Map(); // userId -> boolean
+const sessions = new Map();          // userId -> sock
+const lastQr = new Map();            // userId -> { qr_base64, expires_in_seconds, timestamp }
+const connections = new Map();       // userId -> boolean
+const reconnectAttempts = new Map(); // userId -> number (backoff exponencial)
 
 // Diretório base para credenciais (persistente no Render)
 const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || '/data';
@@ -104,6 +105,7 @@ async function startBot(userId) {
     if (connection === 'open') {
       connections.set(userId, true);
       lastQr.delete(userId);
+      reconnectAttempts.delete(userId); // reset backoff ao conectar com sucesso
       const phoneNumber = extractPhoneNumber(sock);
       console.log(`✅ ${userId} CONECTADO!`);
       void notifyConnectionStatus(userId, 'connected', phoneNumber);
@@ -120,7 +122,6 @@ async function startBot(userId) {
       // Se foi logout intencional pelo WhatsApp -> remover credenciais
       if (statusCode === 401 || loggedOut) {
         void notifyConnectionStatus(userId, 'disconnected');
-        // delete session files if logged out / device removed
         try {
           const dir = path.join(AUTH_BASE_DIR, userId);
           fs.rmSync(dir, { recursive: true, force: true });
@@ -129,14 +130,20 @@ async function startBot(userId) {
           console.warn('Falha ao remover auth dir:', e?.message || e);
         }
         sessions.delete(userId);
+        reconnectAttempts.delete(userId);
         lastQr.delete(userId);
         return;
       }
 
-      // caso não seja logout, tenta reconectar automaticamente após um pequeno delay
+      // Reconexão com backoff exponencial: 2s, 4s, 8s, 16s, 32s, máx 60s
+      // Evita rate limiting do WhatsApp que causa novos QR codes
       void notifyConnectionStatus(userId, 'disconnected');
       try { sessions.delete(userId); } catch (e) {}
-      setTimeout(() => startBot(userId).catch(err => console.error('Erro restart startBot:', err)), 2000);
+      const attempts = (reconnectAttempts.get(userId) || 0) + 1;
+      reconnectAttempts.set(userId, attempts);
+      const delay = Math.min(2000 * Math.pow(2, attempts - 1), 60000);
+      console.log(`🔄 Reconectando ${userId} em ${delay}ms (tentativa ${attempts})`);
+      setTimeout(() => startBot(userId).catch(err => console.error('Erro restart startBot:', err)), delay);
     }
   });
 
@@ -448,11 +455,16 @@ app.post('/api/restart', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
 
+// Diretórios do sistema de arquivos que nunca são sessões válidas
+const SYSTEM_DIRS = new Set(['lost+found', 'tmp', 'proc', 'sys', 'dev']);
+
 // Auto-boot: reconecta todas as sessões salvas em disco
 (async () => {
   try {
     const entries = fs.readdirSync(AUTH_BASE_DIR, { withFileTypes: true });
-    const userIds = entries.filter(e => e.isDirectory()).map(e => e.name);
+    const userIds = entries
+      .filter(e => e.isDirectory() && !SYSTEM_DIRS.has(e.name) && !e.name.startsWith('.'))
+      .map(e => e.name);
     if (userIds.length === 0) {
       console.log('ℹ️ Auto-boot: nenhuma sessão salva encontrada');
       return;
