@@ -72,18 +72,27 @@ async function startBot(userId) {
   // Colocamos userId dentro do browser fingerprint p/ evitar conflitos
   const sock = makeWASocket({
     version,
-    logger: P({ level: 'info' }),
+    logger: P({ level: 'silent' }), // suprimir logs internos do Baileys (decrypt, keep-alive, etc)
     printQRInTerminal: false,
     auth: state,
     browser: ['GendaBot', String(userId).slice(0, 20), '1.0'],
     markOnlineOnConnect: false,
     syncFullHistory: false,
     connectTimeoutMs: 60_000,
-    keepAliveIntervalMs: 15_000,
+    keepAliveIntervalMs: 30_000, // 30s — menos agressivo, evita timeouts de keep-alive
+    retryRequestDelayMs: 2_000,
   });
 
   // salva credenciais quando atualizam
   sock.ev.on('creds.update', saveCreds);
+
+  // Tratar falhas de descriptografia silenciosamente (SessionError)
+  // Baileys envia retry receipt automaticamente — não precisa logar como erro
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const msg of messages) {
+      if (msg.messageStubType === 2) continue; // ignorar stubs
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
