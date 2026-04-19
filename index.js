@@ -135,6 +135,18 @@ async function startBot(userId) {
         return;
       }
 
+      // QR expirou sem ninguém escanear — não reconectar automaticamente.
+      // O usuário precisa solicitar via app. Reconectar aqui só gera loop infinito de QR.
+      const qrExpired = boom?.message?.includes('QR refs attempts ended') ||
+        lastDisconnect?.error?.message?.includes('QR refs attempts ended');
+      if (qrExpired) {
+        console.log(`⏸️ ${userId} — QR não escaneado, aguardando ação do usuário`);
+        void notifyConnectionStatus(userId, 'disconnected');
+        sessions.delete(userId);
+        reconnectAttempts.delete(userId);
+        return;
+      }
+
       // Reconexão com backoff exponencial: 2s, 4s, 8s, 16s, 32s, máx 60s
       // Evita rate limiting do WhatsApp que causa novos QR codes
       void notifyConnectionStatus(userId, 'disconnected');
@@ -427,8 +439,6 @@ app.post('/api/wipe', async (req, res) => {
       console.warn('Falha ao remover auth dir:', e?.message);
     }
 
-    // inicia nova sessão para gerar novo QR
-    startBot(userId).catch(console.error);
     return res.json({ ok: true, wiped: true });
   } catch (e) {
     console.error(e);
