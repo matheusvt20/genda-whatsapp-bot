@@ -52,16 +52,71 @@ const sessions = new Map();          // userId -> sock
 const lastQr = new Map();            // userId -> { qr_base64, expires_in_seconds, timestamp }
 const connections = new Map();       // userId -> boolean
 const reconnectAttempts = new Map(); // userId -> number (backoff exponencial)
+const sessionHealth = new Map();     // userId -> { status, reason, at }
 
 // Diretório base para credenciais (persistente no Render)
 const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || '/data';
 try { fs.mkdirSync(AUTH_BASE_DIR, { recursive: true }); } catch (e) { console.warn('WARN: não criou AUTH_BASE_DIR:', e?.message); }
 
+function getAuthDirFor(userId) {
+  return path.join(AUTH_BASE_DIR, String(userId));
+}
+
+function getErrorText(error) {
+  const pieces = [
+    error?.message,
+    error?.output?.payload?.error,
+    error?.output?.payload?.message,
+    error?.data?.message,
+    error?.stack,
+  ];
+
+  return pieces.filter(Boolean).join(' ');
+}
+
+function isSessionCorruptionError(statusCode, error) {
+  const text = getErrorText(error).toLowerCase();
+  return statusCode === 515 ||
+    text.includes('bad mac') ||
+    text.includes('sessionerror') ||
+    text.includes('failed to decrypt') ||
+    text.includes('decrypt');
+}
+
+function removeAuthDir(userId, reason) {
+  const dir = getAuthDirFor(userId);
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log(`🗑️ Credenciais removidas para ${userId} (${reason}) - ${dir}`);
+  } catch (e) {
+    console.warn(`Falha ao remover auth dir de ${userId}:`, e?.message || e);
+  }
+}
+
+function markSessionNeedsReconnect(userId, reason) {
+  connections.set(userId, false);
+  sessions.delete(userId);
+  reconnectAttempts.delete(userId);
+  lastQr.delete(userId);
+  sessionHealth.set(userId, {
+    status: 'needs_reconnect',
+    reason,
+    at: new Date().toISOString(),
+  });
+}
+
+async function handleCorruptedSession(userId, reason) {
+  console.warn(`🧹 Sessão corrompida detectada para ${userId}: ${reason}. Limpando credenciais e aguardando novo QR.`);
+  markSessionNeedsReconnect(userId, reason);
+  removeAuthDir(userId, reason);
+  await notifyConnectionStatus(userId, 'disconnected');
+}
+
 // startBot(userId) -> inicia sessão Baileys para userId
 async function startBot(userId) {
   if (sessions.get(userId)) return sessions.get(userId);
 
-  const authDir = path.join(AUTH_BASE_DIR, userId);
+  const authDir = getAuthDirFor(userId);
   try { fs.mkdirSync(authDir, { recursive: true }); } catch (e) { console.warn('WARN: não criou authDir:', authDir, e?.message); }
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -115,6 +170,7 @@ async function startBot(userId) {
       connections.set(userId, true);
       lastQr.delete(userId);
       reconnectAttempts.delete(userId); // reset backoff ao conectar com sucesso
+      sessionHealth.delete(userId);
       const phoneNumber = extractPhoneNumber(sock);
       console.log(`✅ ${userId} CONECTADO!`);
       void notifyConnectionStatus(userId, 'connected', phoneNumber);
@@ -131,16 +187,16 @@ async function startBot(userId) {
       // Se foi logout intencional pelo WhatsApp -> remover credenciais
       if (statusCode === 401 || loggedOut) {
         void notifyConnectionStatus(userId, 'disconnected');
-        try {
-          const dir = path.join(AUTH_BASE_DIR, userId);
-          fs.rmSync(dir, { recursive: true, force: true });
-          console.log(`🗑️ Credenciais removidas para ${userId} (logout) - ${dir}`);
-        } catch (e) {
-          console.warn('Falha ao remover auth dir:', e?.message || e);
-        }
+        removeAuthDir(userId, 'logout');
         sessions.delete(userId);
         reconnectAttempts.delete(userId);
         lastQr.delete(userId);
+        sessionHealth.delete(userId);
+        return;
+      }
+
+      if (isSessionCorruptionError(statusCode, boom)) {
+        void handleCorruptedSession(userId, `status_${statusCode || 'unknown'}_session_corruption`);
         return;
       }
 
@@ -153,6 +209,7 @@ async function startBot(userId) {
         void notifyConnectionStatus(userId, 'disconnected');
         sessions.delete(userId);
         reconnectAttempts.delete(userId);
+        sessionHealth.delete(userId);
         return;
       }
 
@@ -190,6 +247,7 @@ app.use(cors(corsOptions));
 function buildQrResponse(userId) {
   const connected = !!connections.get(userId);
   const qrInfo = lastQr.get(userId);
+  const health = sessionHealth.get(userId);
 
   if (connected) return { ok: true, status: 'connected', connected: true };
 
@@ -211,11 +269,17 @@ function buildQrResponse(userId) {
     };
   }
 
-  return { ok: false, status: 'offline', connected: false };
-}
+  if (health?.status === 'needs_reconnect') {
+    return {
+      ok: false,
+      status: 'needs_reconnect',
+      connected: false,
+      error: health.reason,
+      since: health.at,
+    };
+  }
 
-function getAuthDirFor(userId) {
-  return path.join(AUTH_BASE_DIR, String(userId));
+  return { ok: false, status: 'offline', connected: false };
 }
 
 // ---------- Public endpoints ----------
@@ -241,6 +305,7 @@ app.get('/api/qr', async (req, res) => {
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
   if (!sessions.get(userId)) {
+    sessionHealth.delete(userId);
     try { await startBot(userId); } catch (e) {
       console.error('Erro ao iniciar sessão em /api/qr:', e);
       return res.status(500).json({ ok: false, error: 'START_FAILED' });
@@ -279,6 +344,7 @@ app.get('/api/qr.png', async (req, res) => {
   if (!userId) return res.status(400).json({ ok: false, error: 'MISSING_USER_ID' });
 
   if (!sessions.get(userId)) {
+    sessionHealth.delete(userId);
     try { await startBot(userId); } catch (e) {
       console.error('Erro ao iniciar sessão em /api/qr.png:', e);
       return res.status(500).json({ ok: false, error: 'START_FAILED' });
@@ -344,10 +410,12 @@ app.get('/api/status', (req, res) => {
   const qrInfo = lastQr.get(userId);
   const hasQr = !!qrInfo;
   const session = sessions.get(userId);
+  const health = sessionHealth.get(userId);
   const phoneNumber = extractPhoneNumber(session);
   let status = 'offline';
   if (isConnected) status = 'connected';
   else if (hasQr) status = 'qr';
+  else if (health?.status === 'needs_reconnect') status = 'needs_reconnect';
   else if (sessions.get(userId)) status = 'reconnecting';
 
   res.json({
@@ -356,6 +424,10 @@ app.get('/api/status', (req, res) => {
     connected: isConnected,
     phone_number: phoneNumber,
     timestamp: new Date().toISOString(),
+    ...(health ? {
+      error: health.reason,
+      error_at: health.at,
+    } : {}),
     ...(qrInfo && !isConnected ? {
       qr_base64: qrInfo.qr_base64,
       expires_in_seconds: qrInfo.expires_in_seconds,
@@ -398,6 +470,16 @@ app.post('/api/send', async (req, res) => {
     });
   } catch (e) {
     console.error('send error', e);
+    const statusCode = e?.output?.statusCode || e?.data?.statusCode;
+    const userId = req.body?.userId;
+    if (userId && isSessionCorruptionError(statusCode, e)) {
+      await handleCorruptedSession(userId, `send_failed_session_corruption_${statusCode || 'unknown'}`);
+      return res.status(409).json({
+        ok: false,
+        error: 'SESSION_CORRUPTED_RECONNECT_REQUIRED',
+        hint: 'Sessão do WhatsApp corrompida. Gere um novo QR e reconecte.',
+      });
+    }
     return res.status(500).json({ ok: false, error: 'SEND_FAILED' });
   }
 });
@@ -418,6 +500,7 @@ async function closeSession(userId, reason = 'manual') {
     sessions.delete(userId);
     connections.set(userId, false);
     lastQr.delete(userId);
+    sessionHealth.delete(userId);
   }
 }
 
@@ -473,6 +556,25 @@ app.post('/api/restart', async (req, res) => {
 // server listen
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`));
+
+async function shutdown(signal) {
+  console.log(`🛑 ${signal} recebido. Fechando ${sessions.size} sessão(ões) sem logout.`);
+  const activeSessions = Array.from(sessions.entries());
+  await Promise.allSettled(activeSessions.map(async ([userId, currentSock]) => {
+    try {
+      connections.set(userId, false);
+      try { currentSock.ws?.close?.(); } catch {}
+      try { currentSock.end?.(); } catch {}
+    } catch (err) {
+      console.warn(`Falha ao fechar sessão ${userId}:`, err?.message || err);
+    }
+  }));
+  sessions.clear();
+  setTimeout(() => process.exit(0), 300);
+}
+
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.once('SIGINT', () => { void shutdown('SIGINT'); });
 
 // Diretórios do sistema de arquivos que nunca são sessões válidas
 const SYSTEM_DIRS = new Set(['lost+found', 'tmp', 'proc', 'sys', 'dev']);
