@@ -1,6 +1,4 @@
-node_modules
+node_modules/
 .env
-
-# credenciais do Baileys (não versionar!)
-auth_info/
-data/auth_info/
+.env.local
+baileys-sessions/
