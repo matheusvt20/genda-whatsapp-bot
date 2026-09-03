@@ -70,6 +70,8 @@ const HISTORY_SYNC_LOOKBACK_MS = Number(process.env.WHATSAPP_HISTORY_SYNC_LOOKBA
 const HISTORY_SYNC_MAX_MESSAGES = Number(process.env.WHATSAPP_HISTORY_SYNC_MAX_MESSAGES || 250);
 const PIPELINE_CONTACT_CACHE_MS = Number(process.env.WHATSAPP_PIPELINE_CONTACT_CACHE_MS || 60 * 1000);
 const BAILEYS_LOG_LEVEL = String(process.env.WHATSAPP_BAILEYS_LOG_LEVEL || "warn").toLowerCase();
+const STATUS_OUTBOX_RETRY_BASE_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_BASE_MS || 2 * 1000);
+const STATUS_OUTBOX_RETRY_MAX_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_MAX_MS || 5 * 60 * 1000);
 const OPPORTUNITY_APPOINTMENT_SYNC_ENABLED =
   String(process.env.WHATSAPP_OPPORTUNITY_APPOINTMENT_SYNC_ENABLED || "true").toLowerCase() !== "false";
 const persistentMediaStorage = createMediaStorage({
@@ -151,10 +153,16 @@ const sessionSendQueues = new Map();
 const outboundMessageCache = new Map();
 const sessionReconnectTimers = new Map();
 const sessionReconnectAttempts = new Map();
+const statusOutbox = new Map();
 let sessionHealthCheckRunning = false;
 let mediaCleanupRunning = false;
+let statusOutboxFlushRunning = false;
+let statusOutboxFlushTimer = null;
+let statusOutboxPersistChain = Promise.resolve();
 const INSTANCE_ID = randomUUID();
 const OUTBOUND_MESSAGE_CACHE_MAX = 1000;
+const STATUS_OUTBOX_PATH = path.join(SESSION_DIR, "whatsapp-status-outbox.json");
+const MESSAGE_STATUS_RANK = Object.freeze({ failed: 0, sent: 1, delivered: 2, read: 3, played: 4 });
 
 function requireInternalToken(req, res, next) {
   const token = req.get("authorization")?.replace(/^Bearer\s+/i, "") || req.get("x-bot-signature");
@@ -613,6 +621,137 @@ function statusNameFromBaileys(status) {
   if (status === 5 || status === "PLAYED") return "played";
   if (status === 0 || status === "ERROR") return "failed";
   return null;
+}
+
+function statusOutboxKey(payload) {
+  const sessionKey = String(payload?.session_key || "").trim();
+  const messageId = String(payload?.whatsapp_message_id || payload?.message_id || "").trim();
+  return sessionKey && messageId ? `${sessionKey}:${messageId}` : null;
+}
+
+function statusRank(status) {
+  return MESSAGE_STATUS_RANK[status] ?? -1;
+}
+
+function statusOutboxRetryDelay(attempt) {
+  const exponent = Math.max(0, Math.min(attempt - 1, 10));
+  return Math.min(STATUS_OUTBOX_RETRY_BASE_MS * (2 ** exponent), STATUS_OUTBOX_RETRY_MAX_MS);
+}
+
+async function persistStatusOutbox() {
+  const serialized = JSON.stringify([...statusOutbox.values()]);
+  const temporaryPath = `${STATUS_OUTBOX_PATH}.${process.pid}.tmp`;
+
+  statusOutboxPersistChain = statusOutboxPersistChain.then(async () => {
+    await fs.writeFile(temporaryPath, serialized, "utf8");
+    await fs.rename(temporaryPath, STATUS_OUTBOX_PATH);
+  });
+
+  return statusOutboxPersistChain;
+}
+
+async function loadStatusOutbox() {
+  try {
+    const raw = await fs.readFile(STATUS_OUTBOX_PATH, "utf8");
+    const entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) throw new Error("outbox must be an array");
+
+    for (const entry of entries) {
+      const key = statusOutboxKey(entry?.payload);
+      if (!key || statusRank(entry?.payload?.status) < 0) continue;
+
+      const current = statusOutbox.get(key);
+      if (!current || statusRank(entry.payload.status) > statusRank(current.payload.status)) {
+        statusOutbox.set(key, {
+          payload: entry.payload,
+          attempts: Math.max(0, Number(entry.attempts) || 0),
+          nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || Date.now()),
+        });
+      }
+    }
+
+    console.log("[bot] restored WhatsApp status outbox", { pending: statusOutbox.size });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    console.warn("[bot] could not restore WhatsApp status outbox; starting empty", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function scheduleStatusOutboxFlush() {
+  if (statusOutboxFlushTimer) clearTimeout(statusOutboxFlushTimer);
+  statusOutboxFlushTimer = null;
+
+  const nextAttemptAt = [...statusOutbox.values()]
+    .reduce((earliest, entry) => Math.min(earliest, entry.nextAttemptAt), Infinity);
+  if (!Number.isFinite(nextAttemptAt)) return;
+
+  const delayMs = Math.max(0, nextAttemptAt - Date.now());
+  statusOutboxFlushTimer = setTimeout(() => {
+    statusOutboxFlushTimer = null;
+    void flushStatusOutbox();
+  }, delayMs);
+  statusOutboxFlushTimer.unref?.();
+}
+
+async function enqueueMessageStatusUpdate(payload) {
+  const key = statusOutboxKey(payload);
+  if (!key || statusRank(payload?.status) < 0) return;
+
+  const existing = statusOutbox.get(key);
+  if (existing && statusRank(existing.payload.status) > statusRank(payload.status)) return;
+
+  statusOutbox.set(key, {
+    payload,
+    attempts: existing?.attempts ?? 0,
+    nextAttemptAt: Date.now(),
+  });
+  await persistStatusOutbox();
+  scheduleStatusOutboxFlush();
+  void flushStatusOutbox();
+}
+
+async function flushStatusOutbox() {
+  if (statusOutboxFlushRunning) return;
+  statusOutboxFlushRunning = true;
+
+  try {
+    const now = Date.now();
+    const dueEntries = [...statusOutbox.entries()]
+      .filter(([, entry]) => entry.nextAttemptAt <= now)
+      .sort(([, left], [, right]) => left.nextAttemptAt - right.nextAttemptAt);
+
+    for (const [key, entry] of dueEntries) {
+      // The entry may have been replaced by a newer (higher) status while this
+      // flush was waiting. In that case, send only the newest state.
+      if (statusOutbox.get(key) !== entry) continue;
+
+      try {
+        await postMessageStatusUpdate(entry.payload);
+        if (statusOutbox.get(key) === entry) {
+          statusOutbox.delete(key);
+          await persistStatusOutbox();
+        }
+      } catch (error) {
+        if (statusOutbox.get(key) !== entry) continue;
+        entry.attempts += 1;
+        entry.nextAttemptAt = Date.now() + statusOutboxRetryDelay(entry.attempts);
+        statusOutbox.set(key, entry);
+        await persistStatusOutbox();
+        console.warn("[bot] status update queued for retry", {
+          messageId: entry.payload.whatsapp_message_id,
+          status: entry.payload.status,
+          attempt: entry.attempts,
+          retryInMs: entry.nextAttemptAt - Date.now(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  } finally {
+    statusOutboxFlushRunning = false;
+    scheduleStatusOutboxFlush();
+  }
 }
 
 function isIgnorableJid(jid) {
@@ -1764,7 +1903,7 @@ async function startSession(sessionKey) {
         const dedupeKey = `${sessionKey}:${messageId}:${status}`;
         if (rememberStatusUpdate(dedupeKey)) continue;
 
-        await postMessageStatusUpdate({
+        await enqueueMessageStatusUpdate({
           session_key: sessionKey,
           message_id: messageId,
           whatsapp_message_id: messageId,
@@ -2133,6 +2272,8 @@ async function runSessionHealthCheck() {
 async function startServer() {
   ensureConfig();
   await fs.mkdir(SESSION_DIR, { recursive: true });
+  await loadStatusOutbox();
+  void flushStatusOutbox();
 
   const server = app.listen(PORT, () => {
     console.log(`[bot] listening on ${PORT}`);
