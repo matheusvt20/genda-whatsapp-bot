@@ -17,7 +17,12 @@ import {
   extractMessageType,
   unwrapMessageContent,
 } from "./message-content.js";
-import { normalizeBrazilianPhone, phoneFromJid } from "./phone.js";
+import {
+  normalizeBrazilianPhone,
+  phoneFromJid,
+  pickCanonicalWhatsAppJid,
+  whatsappPhoneCandidates,
+} from "./phone.js";
 import { computeReconnectDelayMs, shouldResetReconnectAttempts } from "./reconnect-policy.js";
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 
@@ -1816,10 +1821,41 @@ async function waitForConnectedSession(session, timeoutMs = 15000) {
   return session;
 }
 
+async function resolveWhatsAppDestination(sock, rawPhone, rawJid) {
+  const providedJid = normalizeDirectJid(rawJid);
+  if (providedJid?.endsWith("@lid")) {
+    return { jid: providedJid, resolvedBy: "provided_jid" };
+  }
+
+  const phoneCandidates = whatsappPhoneCandidates(rawPhone || phoneFromJid(providedJid));
+  if (phoneCandidates.length === 0) {
+    return providedJid ? { jid: providedJid, resolvedBy: "provided_jid" } : null;
+  }
+
+  const lookupJids = phoneCandidates.map((phone) => `${phone}@s.whatsapp.net`);
+  const lookupResults = await sock.onWhatsApp(...lookupJids);
+  if (!Array.isArray(lookupResults)) {
+    const error = new Error("WhatsApp number lookup did not return a result");
+    error.code = "WHATSAPP_LOOKUP_FAILED";
+    error.httpStatus = 503;
+    throw error;
+  }
+
+  const canonicalJid = pickCanonicalWhatsAppJid(lookupResults, phoneCandidates);
+  if (!canonicalJid) {
+    const error = new Error("Phone number is not registered on WhatsApp");
+    error.code = "WHATSAPP_NUMBER_NOT_REGISTERED";
+    error.httpStatus = 422;
+    throw error;
+  }
+
+  return { jid: canonicalJid, resolvedBy: "on_whatsapp" };
+}
+
 async function sendManualMessage(req, res) {
   const sessionKey = String(req.body?.sessionKey || req.body?.session_key || req.body?.userId || "").trim();
   const to = normalizeBrazilianPhone(req.body?.to);
-  const destinationJid = normalizeDirectJid(req.body?.jid || req.body?.whatsapp_jid) || (to ? `${to}@s.whatsapp.net` : null);
+  const requestedJid = req.body?.jid || req.body?.whatsapp_jid;
   const text = String(req.body?.text || "").trim();
   const mediaBase64 = String(req.body?.mediaBase64 || req.body?.media_base64 || "").replace(/^data:[^;]+;base64,/i, "").trim();
   const mediaType = String(req.body?.mediaType || req.body?.media_type || "").trim();
@@ -1827,7 +1863,7 @@ async function sendManualMessage(req, res) {
   const fileName = String(req.body?.fileName || req.body?.file_name || "arquivo").trim().replace(/[^\w.\-\s()[\]]+/g, "_").slice(0, 120) || "arquivo";
   const hasMedia = Boolean(mediaBase64);
 
-  if (!sessionKey || !destinationJid || (!text && !hasMedia)) {
+  if (!sessionKey || (!requestedJid && !to) || (!text && !hasMedia)) {
     return res.status(400).json({ success: false, error: "sessionKey, destination and text or media are required" });
   }
 
@@ -1845,6 +1881,12 @@ async function sendManualMessage(req, res) {
     if (!readySession.sock || readySession.status !== "connected") {
       return res.status(409).json({ success: false, error: "session not connected", status: readySession.status });
     }
+
+    const destination = await resolveWhatsAppDestination(readySession.sock, to, requestedJid);
+    if (!destination?.jid) {
+      return res.status(400).json({ success: false, error: "invalid WhatsApp destination" });
+    }
+    const destinationJid = destination.jid;
 
     let payload;
     let mediaBuffer = null;
@@ -1883,13 +1925,18 @@ async function sendManualMessage(req, res) {
       success: true,
       status: "sent",
       messageId: result?.key?.id || null,
-      jid: result?.key?.remoteJid || `${to}@s.whatsapp.net`,
+      jid: result?.key?.remoteJid || destinationJid,
+      destinationResolvedBy: destination.resolvedBy,
       key: result?.key || null,
       mediaUrl,
       media_url: mediaUrl,
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error instanceof Error ? error.message : "send failed" });
+    const httpStatus = Number.isInteger(error?.httpStatus) ? error.httpStatus : 500;
+    res.status(httpStatus).json({
+      success: false,
+      error: error?.code || (error instanceof Error ? error.message : "send failed"),
+    });
   }
 }
 
