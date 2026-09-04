@@ -25,6 +25,7 @@ import {
 } from "./phone.js";
 import { computeReconnectDelayMs, shouldResetReconnectAttempts } from "./reconnect-policy.js";
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
+import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -1532,10 +1533,7 @@ async function postMessageStatusUpdate(payload) {
     }),
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Supabase status webhook failed ${response.status}: ${errorText}`);
-  }
+  return assertMessageStatusWebhookAccepted(response);
 }
 
 async function createSession(sessionKey) {
