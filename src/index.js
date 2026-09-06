@@ -26,6 +26,7 @@ import {
 import { computeReconnectDelayMs, shouldResetReconnectAttempts } from "./reconnect-policy.js";
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
+import { computeStatusOutboxRetryDelay } from "./status-outbox.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -73,6 +74,11 @@ const PIPELINE_CONTACT_CACHE_MS = Number(process.env.WHATSAPP_PIPELINE_CONTACT_C
 const BAILEYS_LOG_LEVEL = String(process.env.WHATSAPP_BAILEYS_LOG_LEVEL || "warn").toLowerCase();
 const STATUS_OUTBOX_RETRY_BASE_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_BASE_MS || 2 * 1000);
 const STATUS_OUTBOX_RETRY_MAX_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_MAX_MS || 5 * 60 * 1000);
+// O ACK do WhatsApp costuma chegar milissegundos antes de a Edge Function
+// persistir a mensagem. Faça algumas tentativas curtas antes do backoff
+// normal para refletir o tique de entrega sem atrasar a interface.
+const STATUS_OUTBOX_FAST_RETRY_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_MS || 250);
+const STATUS_OUTBOX_FAST_RETRY_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_ATTEMPTS || 3);
 const OPPORTUNITY_APPOINTMENT_SYNC_ENABLED =
   String(process.env.WHATSAPP_OPPORTUNITY_APPOINTMENT_SYNC_ENABLED || "true").toLowerCase() !== "false";
 const persistentMediaStorage = createMediaStorage({
@@ -635,8 +641,12 @@ function statusRank(status) {
 }
 
 function statusOutboxRetryDelay(attempt) {
-  const exponent = Math.max(0, Math.min(attempt - 1, 10));
-  return Math.min(STATUS_OUTBOX_RETRY_BASE_MS * (2 ** exponent), STATUS_OUTBOX_RETRY_MAX_MS);
+  return computeStatusOutboxRetryDelay(attempt, {
+    fastRetryMs: STATUS_OUTBOX_FAST_RETRY_MS,
+    fastRetryAttempts: STATUS_OUTBOX_FAST_RETRY_ATTEMPTS,
+    retryBaseMs: STATUS_OUTBOX_RETRY_BASE_MS,
+    retryMaxMs: STATUS_OUTBOX_RETRY_MAX_MS,
+  });
 }
 
 async function persistStatusOutbox() {
