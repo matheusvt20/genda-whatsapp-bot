@@ -820,23 +820,34 @@ function normalizeSendableJid(rawJid) {
   return normalizeDirectJid(jid);
 }
 
-async function groupSubjectFromMessage(session, groupJid) {
+function groupParticipantJid(participant) {
+  return String(typeof participant === "string" ? participant : participant?.id || participant?.jid || "").trim() || null;
+}
+
+function groupParticipantName(participant) {
+  if (!participant || typeof participant === "string") return null;
+  return String(participant.name || participant.notify || participant.verifiedName || "").trim() || null;
+}
+
+async function groupDetailsFromMessage(session, groupJid, { force = false } = {}) {
   if (!isGroupJid(groupJid) || !session?.sock) return null;
   const cacheKey = `${session.sessionKey}:${groupJid}`;
   const cached = groupMetadataCache.get(cacheKey);
-  if (cached && Date.now() - cached.loadedAt < GROUP_METADATA_CACHE_MS) return cached.subject;
+  if (!force && cached && Date.now() - cached.loadedAt < GROUP_METADATA_CACHE_MS) return cached;
 
   try {
     const metadata = await session.sock.groupMetadata(groupJid);
     const subject = String(metadata?.subject || "").trim() || null;
-    groupMetadataCache.set(cacheKey, { subject, loadedAt: Date.now() });
-    return subject;
+    const participants = Array.isArray(metadata?.participants) ? metadata.participants : [];
+    const details = { subject, participantCount: participants.length, participants, loadedAt: Date.now() };
+    groupMetadataCache.set(cacheKey, details);
+    return details;
   } catch (error) {
     console.warn("[bot] could not load WhatsApp group metadata", {
       groupJid,
       error: error instanceof Error ? error.message : String(error),
     });
-    return cached?.subject ?? null;
+    return cached ?? null;
   }
 }
 
@@ -1176,7 +1187,7 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     return false;
   }
 
-  const groupSubject = isGroup ? await groupSubjectFromMessage(session, jid) : null;
+  const groupDetails = isGroup ? await groupDetailsFromMessage(session, jid) : null;
 
   await postInboundEvent({
     session_key: session.sessionKey,
@@ -1185,7 +1196,8 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     whatsapp_jid: jid,
     is_group: isGroup,
     group_jid: isGroup ? jid : null,
-    group_subject: groupSubject,
+    group_subject: groupDetails?.subject ?? null,
+    group_participant_count: groupDetails?.participantCount ?? null,
     participant_jid: isGroup ? message?.key?.participant || message?.key?.participantAlt || null : null,
     contact_phone: contactPhone,
     contact_name: fromMe ? null : message.pushName || null,
@@ -1951,6 +1963,45 @@ async function startSession(sessionKey) {
         });
       }
     }
+    });
+  });
+
+  sock.ev.on("group-participants.update", (update) => {
+    runSessionEvent(session, "group-participants.update", async () => {
+      const groupJid = String(update?.id || "").trim();
+      const action = String(update?.action || "").trim();
+      const rawParticipants = Array.isArray(update?.participants) ? update.participants : [];
+      if (!isGroupJid(groupJid) || !["add", "remove", "promote", "demote"].includes(action) || !rawParticipants.length) return;
+
+      const cacheKey = `${session.sessionKey}:${groupJid}`;
+      const previousDetails = groupMetadataCache.get(cacheKey);
+      const currentDetails = await groupDetailsFromMessage(session, groupJid, { force: true });
+      const knownParticipants = [
+        ...(currentDetails?.participants || []),
+        ...(previousDetails?.participants || []),
+      ];
+      const participants = rawParticipants
+        .map((participant) => {
+          const jid = groupParticipantJid(participant);
+          const known = knownParticipants.find((candidate) => groupParticipantJid(candidate) === jid);
+          return { jid, name: groupParticipantName(participant) || groupParticipantName(known) };
+        })
+        .filter((participant) => Boolean(participant.jid));
+      if (!participants.length) return;
+
+      const eventWindow = Math.floor(Date.now() / 30000);
+      await postInboundEvent({
+        event: "group_participants",
+        session_key: session.sessionKey,
+        is_group: true,
+        group_jid: groupJid,
+        group_subject: currentDetails?.subject || previousDetails?.subject || null,
+        group_participant_count: currentDetails?.participantCount ?? null,
+        group_action: action,
+        group_participants: participants,
+        group_event_id: `${groupJid}:${action}:${participants.map((participant) => participant.jid).sort().join(",")}:${eventWindow}`,
+        timestamp: Date.now(),
+      });
     });
   });
 
