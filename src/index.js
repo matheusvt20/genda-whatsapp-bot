@@ -81,6 +81,7 @@ const STATUS_OUTBOX_FAST_RETRY_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FA
 const STATUS_OUTBOX_FAST_RETRY_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_ATTEMPTS || 3);
 const STATUS_OUTBOX_MAX_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_MAX_ATTEMPTS || 8);
 const STATUS_OUTBOX_FLUSH_BATCH_SIZE = Number(process.env.WHATSAPP_STATUS_OUTBOX_FLUSH_BATCH_SIZE || 10);
+const GROUP_METADATA_CACHE_MS = Number(process.env.WHATSAPP_GROUP_METADATA_CACHE_MS || 10 * 60 * 1000);
 const OPPORTUNITY_APPOINTMENT_SYNC_ENABLED =
   String(process.env.WHATSAPP_OPPORTUNITY_APPOINTMENT_SYNC_ENABLED || "true").toLowerCase() !== "false";
 const persistentMediaStorage = createMediaStorage({
@@ -156,6 +157,7 @@ const processedMessageIds = new Set();
 const processedStatusUpdates = new Set();
 const mediaMessages = new Map();
 const pipelineContactCache = new Map();
+const groupMetadataCache = new Map();
 const decryptRecoveryState = new Map();
 const messageListenerRecoveryState = new Map();
 const sessionSendQueues = new Map();
@@ -798,7 +800,11 @@ async function flushStatusOutbox() {
 }
 
 function isIgnorableJid(jid) {
-  return !jid || jid === "status@broadcast" || jid.endsWith("@g.us") || jid.endsWith("@newsletter");
+  return !jid || jid === "status@broadcast" || jid.endsWith("@newsletter");
+}
+
+function isGroupJid(jid) {
+  return String(jid || "").trim().endsWith("@g.us");
 }
 
 function normalizeDirectJid(rawJid) {
@@ -806,6 +812,32 @@ function normalizeDirectJid(rawJid) {
   if (!jid || isIgnorableJid(jid)) return null;
   if (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid")) return jid;
   return null;
+}
+
+function normalizeSendableJid(rawJid) {
+  const jid = String(rawJid || "").trim();
+  if (isGroupJid(jid)) return jid;
+  return normalizeDirectJid(jid);
+}
+
+async function groupSubjectFromMessage(session, groupJid) {
+  if (!isGroupJid(groupJid) || !session?.sock) return null;
+  const cacheKey = `${session.sessionKey}:${groupJid}`;
+  const cached = groupMetadataCache.get(cacheKey);
+  if (cached && Date.now() - cached.loadedAt < GROUP_METADATA_CACHE_MS) return cached.subject;
+
+  try {
+    const metadata = await session.sock.groupMetadata(groupJid);
+    const subject = String(metadata?.subject || "").trim() || null;
+    groupMetadataCache.set(cacheKey, { subject, loadedAt: Date.now() });
+    return subject;
+  } catch (error) {
+    console.warn("[bot] could not load WhatsApp group metadata", {
+      groupJid,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return cached?.subject ?? null;
+  }
 }
 
 function contactPhoneFromJid(jid) {
@@ -1111,6 +1143,7 @@ function isPipelineHistoryMessage(message, keys) {
 
 async function forwardWhatsAppMessage(session, message, source = "notify") {
   const jid = message?.key?.remoteJid;
+  const isGroup = isGroupJid(jid);
   const fromMe = isMessageFromConnectedAccount(session, message);
   const messageId = message?.key?.id;
   const dedupeKey = `${session.sessionKey}:${jid}:${messageId}`;
@@ -1126,7 +1159,7 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
   const body = extractMessageText(message);
   const messageType = extractMessageType(message);
   const mediaUrl = await persistMediaMessage(message, session.sessionKey);
-  const contactPhone = contactPhoneFromMessage(message);
+  const contactPhone = isGroup ? senderPhoneFromMessage(message) : contactPhoneFromMessage(message);
   if (!body?.trim() && !mediaUrl) {
     if (source === "notify") {
       console.log("[bot] live message ignored", {
@@ -1143,11 +1176,17 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     return false;
   }
 
+  const groupSubject = isGroup ? await groupSubjectFromMessage(session, jid) : null;
+
   await postInboundEvent({
     session_key: session.sessionKey,
     message_id: messageId,
     whatsapp_message_id: messageId,
     whatsapp_jid: jid,
+    is_group: isGroup,
+    group_jid: isGroup ? jid : null,
+    group_subject: groupSubject,
+    participant_jid: isGroup ? message?.key?.participant || message?.key?.participantAlt || null : null,
     contact_phone: contactPhone,
     contact_name: fromMe ? null : message.pushName || null,
     body: body?.trim() || null,
@@ -2001,7 +2040,10 @@ async function waitForConnectedSession(session, timeoutMs = 15000) {
 }
 
 async function resolveWhatsAppDestination(sock, rawPhone, rawJid) {
-  const providedJid = normalizeDirectJid(rawJid);
+  const providedJid = normalizeSendableJid(rawJid);
+  if (isGroupJid(providedJid)) {
+    return { jid: providedJid, resolvedBy: "provided_group_jid" };
+  }
   if (providedJid?.endsWith("@lid")) {
     return { jid: providedJid, resolvedBy: "provided_jid" };
   }
