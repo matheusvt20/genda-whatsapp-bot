@@ -32,7 +32,7 @@ test("retries when the message row does not exist yet", async () => {
       found: false,
       current_status: null,
     }), { status: 200 })),
-    /not reconciled yet/,
+    (error) => error?.code === "WHATSAPP_STATUS_NOT_FOUND" && /not reconciled yet/.test(error.message),
   );
 });
 

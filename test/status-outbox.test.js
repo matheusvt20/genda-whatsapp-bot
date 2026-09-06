@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { computeStatusOutboxRetryDelay } from "../src/status-outbox.js";
+import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "../src/status-outbox.js";
 
 const configuration = {
   fastRetryMs: 250,
@@ -19,4 +19,10 @@ test("retries new unmatched status receipts quickly before exponential backoff",
 
 test("caps the normal retry delay", () => {
   assert.equal(computeStatusOutboxRetryDelay(20, configuration), 300_000);
+});
+
+test("discards permanently unmatched receipts after the configured limit", () => {
+  assert.equal(shouldRetainStatusOutboxEntry(0, 8), true);
+  assert.equal(shouldRetainStatusOutboxEntry(7, 8), true);
+  assert.equal(shouldRetainStatusOutboxEntry(8, 8), false);
 });

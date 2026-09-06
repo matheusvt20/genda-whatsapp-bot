@@ -26,7 +26,7 @@ import {
 import { computeReconnectDelayMs, shouldResetReconnectAttempts } from "./reconnect-policy.js";
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
-import { computeStatusOutboxRetryDelay } from "./status-outbox.js";
+import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -79,6 +79,8 @@ const STATUS_OUTBOX_RETRY_MAX_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RET
 // normal para refletir o tique de entrega sem atrasar a interface.
 const STATUS_OUTBOX_FAST_RETRY_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_MS || 250);
 const STATUS_OUTBOX_FAST_RETRY_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_ATTEMPTS || 3);
+const STATUS_OUTBOX_MAX_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_MAX_ATTEMPTS || 8);
+const STATUS_OUTBOX_FLUSH_BATCH_SIZE = Number(process.env.WHATSAPP_STATUS_OUTBOX_FLUSH_BATCH_SIZE || 10);
 const OPPORTUNITY_APPOINTMENT_SYNC_ENABLED =
   String(process.env.WHATSAPP_OPPORTUNITY_APPOINTMENT_SYNC_ENABLED || "true").toLowerCase() !== "false";
 const persistentMediaStorage = createMediaStorage({
@@ -667,21 +669,35 @@ async function loadStatusOutbox() {
     const entries = JSON.parse(raw);
     if (!Array.isArray(entries)) throw new Error("outbox must be an array");
 
+    let discarded = 0;
     for (const entry of entries) {
       const key = statusOutboxKey(entry?.payload);
+      const attempts = Math.max(0, Number(entry?.attempts) || 0);
+      const hasUnmatchedAttempts = Number.isFinite(Number(entry?.unmatchedAttempts));
+      const unmatchedAttempts = hasUnmatchedAttempts
+        ? Math.max(0, Number(entry.unmatchedAttempts))
+        : attempts;
       if (!key || statusRank(entry?.payload?.status) < 0) continue;
+      // Entradas legadas não separavam falha de rede de recibo órfão. Os itens
+      // com muitas tentativas restaurados aqui são o backlog órfão já conhecido.
+      if (!shouldRetainStatusOutboxEntry(unmatchedAttempts, STATUS_OUTBOX_MAX_ATTEMPTS)) {
+        discarded += 1;
+        continue;
+      }
 
       const current = statusOutbox.get(key);
       if (!current || statusRank(entry.payload.status) > statusRank(current.payload.status)) {
         statusOutbox.set(key, {
           payload: entry.payload,
-          attempts: Math.max(0, Number(entry.attempts) || 0),
+          attempts,
+          unmatchedAttempts,
           nextAttemptAt: Math.max(0, Number(entry.nextAttemptAt) || Date.now()),
         });
       }
     }
 
-    console.log("[bot] restored WhatsApp status outbox", { pending: statusOutbox.size });
+    console.log("[bot] restored WhatsApp status outbox", { pending: statusOutbox.size, discarded });
+    if (discarded > 0) await persistStatusOutbox();
   } catch (error) {
     if (error?.code === "ENOENT") return;
     console.warn("[bot] could not restore WhatsApp status outbox; starting empty", {
@@ -716,6 +732,7 @@ async function enqueueMessageStatusUpdate(payload) {
   statusOutbox.set(key, {
     payload,
     attempts: existing?.attempts ?? 0,
+    unmatchedAttempts: existing?.unmatchedAttempts ?? 0,
     nextAttemptAt: Date.now(),
   });
   await persistStatusOutbox();
@@ -731,7 +748,9 @@ async function flushStatusOutbox() {
     const now = Date.now();
     const dueEntries = [...statusOutbox.entries()]
       .filter(([, entry]) => entry.nextAttemptAt <= now)
-      .sort(([, left], [, right]) => left.nextAttemptAt - right.nextAttemptAt);
+      // ACKs novos não podem esperar atrás de centenas de recibos históricos.
+      .sort(([, left], [, right]) => left.attempts - right.attempts || left.nextAttemptAt - right.nextAttemptAt)
+      .slice(0, Math.max(1, STATUS_OUTBOX_FLUSH_BATCH_SIZE));
 
     for (const [key, entry] of dueEntries) {
       // The entry may have been replaced by a newer (higher) status while this
@@ -747,6 +766,19 @@ async function flushStatusOutbox() {
       } catch (error) {
         if (statusOutbox.get(key) !== entry) continue;
         entry.attempts += 1;
+        entry.unmatchedAttempts = error?.code === "WHATSAPP_STATUS_NOT_FOUND"
+          ? (entry.unmatchedAttempts ?? 0) + 1
+          : 0;
+        if (!shouldRetainStatusOutboxEntry(entry.unmatchedAttempts, STATUS_OUTBOX_MAX_ATTEMPTS)) {
+          statusOutbox.delete(key);
+          await persistStatusOutbox();
+          console.warn("[bot] discarded unmatched WhatsApp status update", {
+            messageId: entry.payload.whatsapp_message_id,
+            status: entry.payload.status,
+            attempts: entry.attempts,
+          });
+          continue;
+        }
         entry.nextAttemptAt = Date.now() + statusOutboxRetryDelay(entry.attempts);
         statusOutbox.set(key, entry);
         await persistStatusOutbox();

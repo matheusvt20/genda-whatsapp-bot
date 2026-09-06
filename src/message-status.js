@@ -22,7 +22,9 @@ export async function assertMessageStatusWebhookAccepted(response) {
   // Enquanto o registro não existir, mantenha o evento na outbox para retry.
   // Se ele já existe em um estado mais avançado, `found: true` encerra o retry.
   if (result?.updated === false && result?.found !== true) {
-    throw new Error("WhatsApp message status is not reconciled yet");
+    const error = new Error("WhatsApp message status is not reconciled yet");
+    error.code = "WHATSAPP_STATUS_NOT_FOUND";
+    throw error;
   }
 
   return result;
