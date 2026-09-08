@@ -71,6 +71,10 @@ const HISTORY_SYNC_ENABLED = String(process.env.WHATSAPP_HISTORY_SYNC_ENABLED ||
 const HISTORY_SYNC_LOOKBACK_MS = Number(process.env.WHATSAPP_HISTORY_SYNC_LOOKBACK_MS || 48 * 60 * 60 * 1000);
 const HISTORY_SYNC_MAX_MESSAGES = Number(process.env.WHATSAPP_HISTORY_SYNC_MAX_MESSAGES || 250);
 const PIPELINE_CONTACT_CACHE_MS = Number(process.env.WHATSAPP_PIPELINE_CONTACT_CACHE_MS || 60 * 1000);
+const AVATAR_REFRESH_MS = Number(process.env.WHATSAPP_AVATAR_REFRESH_MS || 7 * 24 * 60 * 60 * 1000);
+const AVATAR_NEGATIVE_TTL_MS = Number(process.env.WHATSAPP_AVATAR_NEGATIVE_TTL_MS || 24 * 60 * 60 * 1000);
+const AVATAR_BACKFILL_LIMIT = Number(process.env.WHATSAPP_AVATAR_BACKFILL_LIMIT || 500);
+const AVATAR_BACKFILL_DELAY_MS = Number(process.env.WHATSAPP_AVATAR_BACKFILL_DELAY_MS || 500);
 const BAILEYS_LOG_LEVEL = String(process.env.WHATSAPP_BAILEYS_LOG_LEVEL || "warn").toLowerCase();
 const STATUS_OUTBOX_RETRY_BASE_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_BASE_MS || 2 * 1000);
 const STATUS_OUTBOX_RETRY_MAX_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_RETRY_MAX_MS || 5 * 60 * 1000);
@@ -158,6 +162,7 @@ const processedStatusUpdates = new Set();
 const mediaMessages = new Map();
 const pipelineContactCache = new Map();
 const groupMetadataCache = new Map();
+const avatarCache = new Map();
 const decryptRecoveryState = new Map();
 const messageListenerRecoveryState = new Map();
 const sessionSendQueues = new Map();
@@ -1152,6 +1157,124 @@ function isPipelineHistoryMessage(message, keys) {
   return Boolean((phone && keys.phones.has(phone)) || (jid && keys.jids.has(jid)));
 }
 
+const AVATAR_BUCKET = "whatsapp-avatars";
+
+function avatarObjectPath(sessionKey, jid) {
+  const safeSession = String(sessionKey).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeJid = String(jid).replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `${safeSession}/${safeJid}.jpg`;
+}
+
+function avatarPublicUrl(objectPath) {
+  return `${SUPABASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${objectPath}`;
+}
+
+async function resolveContactAvatarUrl(session, jid) {
+  if (!SUPABASE_SERVICE_ROLE_KEY || !session?.sock || !jid || isIgnorableJid(jid)) return null;
+
+  const cacheKey = `${session.sessionKey}:${jid}`;
+  const now = Date.now();
+  const cached = avatarCache.get(cacheKey);
+  if (cached && now - cached.at < (cached.url ? AVATAR_REFRESH_MS : AVATAR_NEGATIVE_TTL_MS)) {
+    return cached.url;
+  }
+
+  const objectPath = avatarObjectPath(session.sessionKey, jid);
+  const publicUrl = avatarPublicUrl(objectPath);
+  const info = await supabaseStorageFetch(`/object/info/${AVATAR_BUCKET}/${objectPath}`, { method: "GET" });
+  const mirroredAt = info?.updated_at ? Date.parse(info.updated_at) : null;
+  if (mirroredAt && now - mirroredAt < AVATAR_REFRESH_MS) {
+    avatarCache.set(cacheKey, { url: publicUrl, at: now });
+    return publicUrl;
+  }
+
+  const fallbackUrl = info ? publicUrl : null;
+  let sourceUrl = null;
+  try {
+    sourceUrl = await session.sock.profilePictureUrl(jid, "image");
+  } catch {
+    sourceUrl = null;
+  }
+
+  if (!sourceUrl) {
+    avatarCache.set(cacheKey, { url: fallbackUrl, at: now });
+    return fallbackUrl;
+  }
+
+  try {
+    const response = await fetch(sourceUrl);
+    if (!response.ok) throw new Error(`download status ${response.status}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const uploaded = await supabaseStorageFetch(`/object/${AVATAR_BUCKET}/${objectPath}`, {
+      method: "POST",
+      headers: { "Content-Type": "image/jpeg", "x-upsert": "true" },
+      body: bytes,
+    });
+    if (uploaded === null) throw new Error("upload rejected by Storage");
+
+    avatarCache.set(cacheKey, { url: publicUrl, at: now });
+    return publicUrl;
+  } catch (error) {
+    console.warn("[bot] avatar sync failed", {
+      jidType: String(jid).split("@")[1] || null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    avatarCache.set(cacheKey, { url: fallbackUrl, at: now });
+    return fallbackUrl;
+  }
+}
+
+async function updateConversationAvatar(sessionKey, conversationId, avatarUrl) {
+  const response = await supabaseFetch(
+    `/whatsapp_conversations?id=eq.${encodeURIComponent(conversationId)}&user_id=eq.${encodeURIComponent(sessionKey)}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ contact_avatar_url: avatarUrl }),
+    },
+  );
+  if (!response?.ok) {
+    throw new Error(`conversation avatar update status ${response?.status || "unavailable"}`);
+  }
+}
+
+async function backfillConversationAvatars(session) {
+  if (!session?.sock || session.avatarBackfillRunning) return;
+  session.avatarBackfillRunning = true;
+
+  let checked = 0;
+  let updated = 0;
+  try {
+    const response = await supabaseFetch(
+      `/whatsapp_conversations?user_id=eq.${encodeURIComponent(session.sessionKey)}&contact_avatar_url=is.null&whatsapp_jid=not.is.null&select=id,whatsapp_jid&order=last_message_at.desc&limit=${Math.max(1, AVATAR_BACKFILL_LIMIT)}`,
+    );
+    if (!response?.ok) throw new Error(`conversation avatar list status ${response?.status || "unavailable"}`);
+
+    const rows = await response.json();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!session.sock || session.status !== "connected") break;
+      checked += 1;
+      try {
+        const avatarUrl = await resolveContactAvatarUrl(session, row.whatsapp_jid);
+        if (avatarUrl) {
+          await updateConversationAvatar(session.sessionKey, row.id, avatarUrl);
+          updated += 1;
+        }
+      } catch (error) {
+        console.warn("[bot] avatar backfill item failed", {
+          jidType: String(row.whatsapp_jid || "").split("@")[1] || null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (AVATAR_BACKFILL_DELAY_MS > 0) await sleep(AVATAR_BACKFILL_DELAY_MS);
+    }
+
+    console.log("[bot] avatar backfill completed", { checked, updated });
+  } finally {
+    session.avatarBackfillRunning = false;
+  }
+}
+
 async function forwardWhatsAppMessage(session, message, source = "notify") {
   const jid = message?.key?.remoteJid;
   const isGroup = isGroupJid(jid);
@@ -1187,7 +1310,10 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     return false;
   }
 
-  const groupDetails = isGroup ? await groupDetailsFromMessage(session, jid) : null;
+  const [groupDetails, contactAvatarUrl] = await Promise.all([
+    isGroup ? groupDetailsFromMessage(session, jid) : Promise.resolve(null),
+    resolveContactAvatarUrl(session, jid),
+  ]);
 
   await postInboundEvent({
     session_key: session.sessionKey,
@@ -1201,6 +1327,7 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     participant_jid: isGroup ? message?.key?.participant || message?.key?.participantAlt || null : null,
     contact_phone: contactPhone,
     contact_name: fromMe ? null : message.pushName || null,
+    contact_avatar_url: contactAvatarUrl,
     body: body?.trim() || null,
     media_url: mediaUrl,
     message_type: messageType,
@@ -1784,6 +1911,7 @@ async function startSession(sessionKey) {
       acceptMessagesAfterMs: Date.now() - MESSAGE_REPLAY_GRACE_MS,
       allowHistorySync: HISTORY_SYNC_ENABLED,
       appointmentSyncStarted: false,
+      avatarBackfillRunning: false,
     };
     sessions.set(sessionKey, session);
 
@@ -1850,6 +1978,9 @@ async function startSession(sessionKey) {
       recoverUnhealthyDecryptSession(session, { message: "decrypt errors during reconnect" }, "decrypt_errors_during_connect");
       if (session.status !== "connected") return;
       await syncConnectionStatus(sessionKey, "connected", { phone: session.phone, lastError: session.lastError });
+
+      void backfillConversationAvatars(session)
+        .catch((error) => console.error("[bot] avatar backfill failed", error));
 
       if (session.allowHistorySync && !session.appointmentSyncStarted) {
         session.appointmentSyncStarted = true;
