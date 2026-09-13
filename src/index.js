@@ -24,6 +24,12 @@ import {
   whatsappPhoneCandidates,
 } from "./phone.js";
 import { computeReconnectDelayMs, shouldResetReconnectAttempts } from "./reconnect-policy.js";
+import {
+  applyGroupParticipantUpdate,
+  groupParticipantJid,
+  groupParticipantName,
+  loadGroupDetailsForParticipantUpdate,
+} from "./group-metadata.js";
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
@@ -823,15 +829,6 @@ function normalizeSendableJid(rawJid) {
   const jid = String(rawJid || "").trim();
   if (isGroupJid(jid)) return jid;
   return normalizeDirectJid(jid);
-}
-
-function groupParticipantJid(participant) {
-  return String(typeof participant === "string" ? participant : participant?.id || participant?.jid || "").trim() || null;
-}
-
-function groupParticipantName(participant) {
-  if (!participant || typeof participant === "string") return null;
-  return String(participant.name || participant.notify || participant.verifiedName || "").trim() || null;
 }
 
 async function groupDetailsFromMessage(session, groupJid, { force = false } = {}) {
@@ -2106,10 +2103,18 @@ async function startSession(sessionKey) {
 
       const cacheKey = `${session.sessionKey}:${groupJid}`;
       const previousDetails = groupMetadataCache.get(cacheKey);
-      const currentDetails = await groupDetailsFromMessage(session, groupJid, { force: true });
+      // Forcar groupMetadata em cada entrada/saida faz o aparelho principal
+      // anunciar repetidamente a sincronizacao do dispositivo vinculado.
+      // Carregamos remotamente apenas quando o grupo ainda nao existe no cache;
+      // depois, o proprio evento mantem participantes e contagem atualizados.
+      const baseDetails = await loadGroupDetailsForParticipantUpdate(
+        previousDetails,
+        () => groupDetailsFromMessage(session, groupJid),
+      );
+      const currentDetails = applyGroupParticipantUpdate(baseDetails, action, rawParticipants);
+      if (currentDetails) groupMetadataCache.set(cacheKey, currentDetails);
       const knownParticipants = [
         ...(currentDetails?.participants || []),
-        ...(previousDetails?.participants || []),
       ];
       const participants = rawParticipants
         .map((participant) => {
