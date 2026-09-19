@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import express from "express";
 import makeWASocket, {
   DisconnectReason,
@@ -33,6 +34,7 @@ import {
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
+import { prepareOutgoingAudio } from "./outgoing-audio.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -91,6 +93,7 @@ const STATUS_OUTBOX_FAST_RETRY_MS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FA
 const STATUS_OUTBOX_FAST_RETRY_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_FAST_RETRY_ATTEMPTS || 3);
 const STATUS_OUTBOX_MAX_ATTEMPTS = Number(process.env.WHATSAPP_STATUS_OUTBOX_MAX_ATTEMPTS || 8);
 const STATUS_OUTBOX_FLUSH_BATCH_SIZE = Number(process.env.WHATSAPP_STATUS_OUTBOX_FLUSH_BATCH_SIZE || 10);
+const AUDIO_TRANSCODE_TIMEOUT_MS = Number(process.env.WHATSAPP_AUDIO_TRANSCODE_TIMEOUT_MS || 30 * 1000);
 const GROUP_METADATA_CACHE_MS = Number(process.env.WHATSAPP_GROUP_METADATA_CACHE_MS || 10 * 60 * 1000);
 const OPPORTUNITY_APPOINTMENT_SYNC_ENABLED =
   String(process.env.WHATSAPP_OPPORTUNITY_APPOINTMENT_SYNC_ENABLED || "true").toLowerCase() !== "false";
@@ -201,6 +204,63 @@ function ensureConfig() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function transcodeAudioToOggOpus(input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", [
+      "-hide_banner", "-loglevel", "error",
+      "-i", "pipe:0",
+      "-vn",
+      "-c:a", "libopus",
+      "-b:a", "48k",
+      "-ac", "1",
+      "-ar", "48000",
+      "-f", "ogg",
+      "pipe:1",
+    ], { stdio: ["pipe", "pipe", "pipe"] });
+    const output = [];
+    const errors = [];
+    let settled = false;
+    const finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(buffer);
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      const error = new Error("audio conversion timed out");
+      error.code = "AUDIO_CONVERSION_TIMEOUT";
+      error.httpStatus = 503;
+      finish(error);
+    }, AUDIO_TRANSCODE_TIMEOUT_MS);
+
+    child.on("error", (cause) => {
+      const error = new Error("audio transcoder is unavailable");
+      error.code = "AUDIO_TRANSCODER_UNAVAILABLE";
+      error.httpStatus = 503;
+      error.cause = cause;
+      finish(error);
+    });
+    child.stdout.on("data", (chunk) => output.push(chunk));
+    child.stderr.on("data", (chunk) => errors.push(chunk));
+    child.on("close", (code) => {
+      if (settled) return;
+      if (code !== 0) {
+        const error = new Error("audio conversion failed");
+        error.code = "AUDIO_CONVERSION_FAILED";
+        error.httpStatus = 422;
+        error.details = Buffer.concat(errors).toString("utf8").slice(0, 500);
+        finish(error);
+        return;
+      }
+      finish(null, Buffer.concat(output));
+    });
+    child.stdin.on("error", (error) => finish(error));
+    child.stdin.end(input);
+  });
 }
 
 function clearSessionReconnectTimer(sessionKey) {
@@ -2298,6 +2358,7 @@ async function sendManualMessage(req, res) {
 
     let payload;
     let mediaBuffer = null;
+    let outboundMimeType = mimeType;
     let mediaUrl = null;
     if (hasMedia) {
       const buffer = Buffer.from(mediaBase64, "base64");
@@ -2309,7 +2370,10 @@ async function sendManualMessage(req, res) {
       if (mediaType === "image") {
         payload = { image: buffer, caption: text || undefined, mimetype: mimeType };
       } else if (mediaType === "audio") {
-        payload = { audio: buffer, mimetype: mimeType, ptt: false };
+        const preparedAudio = await prepareOutgoingAudio(buffer, transcodeAudioToOggOpus);
+        mediaBuffer = preparedAudio.buffer;
+        outboundMimeType = preparedAudio.mimeType;
+        payload = { audio: mediaBuffer, mimetype: outboundMimeType, ptt: true };
       } else if (mediaType === "video") {
         payload = { video: buffer, caption: text || undefined, mimetype: mimeType };
       } else {
@@ -2320,18 +2384,24 @@ async function sendManualMessage(req, res) {
     }
 
     const result = await enqueueSessionSend(sessionKey, async () => readySession.sock.sendMessage(destinationJid, payload));
+    if (!result?.key?.id || !result?.key?.remoteJid) {
+      const error = new Error("Baileys did not confirm the message acceptance");
+      error.code = "MESSAGE_NOT_ACCEPTED";
+      error.httpStatus = 502;
+      throw error;
+    }
     if (mediaBuffer) {
       mediaUrl = await persistMediaBuffer(mediaBuffer, {
         sessionKey,
         messageId: result?.key?.id,
-        mimetype: mimeType,
+        mimetype: outboundMimeType,
         fileName,
       });
     }
     rememberOutboundMessage(result?.key, result?.message);
     res.json({
       success: true,
-      status: "sent",
+      status: "accepted",
       messageId: result?.key?.id || null,
       jid: result?.key?.remoteJid || destinationJid,
       destinationResolvedBy: destination.resolvedBy,
