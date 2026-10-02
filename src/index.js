@@ -13,6 +13,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import {
+  extractAdContext,
   extractMediaInfo,
   extractMessageText,
   extractMessageType,
@@ -1349,6 +1350,7 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
 
   const body = extractMessageText(message);
   const messageType = extractMessageType(message);
+  const adContext = fromMe ? null : extractAdContext(message);
   const mediaUrl = await persistMediaMessage(message, session.sessionKey);
   const contactPhone = isGroup ? senderPhoneFromMessage(message) : contactPhoneFromMessage(message);
   if (!body?.trim() && !mediaUrl) {
@@ -1390,6 +1392,8 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     message_type: messageType,
     timestamp: parseMessageTimestamp(message.messageTimestamp),
     direction: fromMe ? "outbound" : "inbound",
+    // Só quando a mensagem veio de um anúncio "Enviar mensagem"; sem anúncio o payload fica igual ao de antes.
+    ...(adContext ? { ad_context: adContext } : {}),
   });
 
   return true;
