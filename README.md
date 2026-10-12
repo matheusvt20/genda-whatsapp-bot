@@ -5,21 +5,10 @@ ou ferramentas internas com token. O frontend nao deve receber `BOT_INTERNAL_TOK
 
 ## Railway
 
-Root Directory:
-
-```txt
-railway/whatsapp-bot
-```
-
-Deploy local recomendado:
-
-```bash
-railway up railway/whatsapp-bot --path-as-root -s genda-whatsapp-bot --detach
-```
-
-O diretorio do bot tem `Dockerfile` proprio. Use `--path-as-root` para que o
-Railway leia `railway/whatsapp-bot/railway.json` e nao tente empacotar o
-monorepo inteiro.
+Fonte de producao: `matheusvt20/genda-whatsapp-bot`, branch `main`, conectado
+ao servico Railway `genda-whatsapp-bot`. O push no `main` dispara o deploy.
+O Root Directory e a raiz deste repositorio, com seu `Dockerfile` e `railway.json`.
+A copia `railway/whatsapp-bot` no monorepo do frontend nao e a fonte publicada.
 
 Start Command:
 
@@ -95,8 +84,58 @@ conflito continuam encerrando uma autorizacao revogada. O campo
 sem credenciais. O health identifica esta revisao por
 `checks.session_recovery_version = "2026-10-12"`.
 
-Para publicar este repositorio separado, use sua raiz como diretorio de deploy;
-o trecho `railway/whatsapp-bot` acima descreve apenas a antiga copia do monorepo.
+## Diagnostico e prevencao de desconexoes
+
+O diario `SESSION_DIR/connection-diagnostics/YYYY-MM-DD.ndjson` registra eventos
+por conta, instancia e deployment. Com `/data`, os registros sobrevivem ao
+reinicio do servico. A retencao e de 30 dias, com limite de 2 MiB por dia e 1000
+gravacoes pendentes. Arquivos tem permissao `0600`; falhas de gravacao e descartes
+aparecem no health. A falha do diario nao interrompe a conexao ou envio.
+
+Eventos incluem abertura/queda, codigo nativo de fechamento do WebSocket, codigo
+de erro de rede, resposta HTTP do transporte, motivo de stream do WhatsApp,
+reconexoes, restauracao/limpeza da autorizacao e recuperacoes iniciadas pelo
+Genda. Memoria e uptime sao capturados no evento; CPU e atraso do event loop
+sao amostrados a cada 30 segundos. O diario nao recebe mensagens, numeros de
+telefone, QR, tokens, chaves, headers ou motivos como texto livre.
+
+`cause=internal_action` identifica uma acao do bot; `device_removed` indica
+revogacao informada pelo WhatsApp, sem identificar quem a fez. `session_conflict`
+e `provider_stream_error` conservam o sinal fornecido pelo provedor. Um `428`
+sem outra evidencia recebe `transport_closed_unknown`: nao prova problema no
+celular, notebook, rede ou Railway. `transport_failure` indica erro observado
+no transporte, sem atribuir a origem da falha. O historico comeca nesta versao;
+ele nao recupera detalhes que o codigo anterior deixou de registrar.
+
+Tres quedas na mesma conta em 10 minutos aplicam uma pausa de pelo menos 30
+segundos, aumentando ate 5 minutos. O backoff existente continua valendo se
+for maior. A protecao e independente por conta, preserva credenciais e retoma
+automaticamente. O restart `515` do pareamento e os encerramentos de deploy
+nao entram nessa contagem. As quedas recentes sao recuperadas do diario apos
+reinicio. Revogacoes reais continuam exigindo novo QR.
+
+SIGTERM/SIGINT registram encerramento, drenam eventos pendentes e encerram os
+sockets sem gravar uma desconexao no banco ou apagar autorizacao. Isso permite
+que o deployment seguinte restaure as contas conectadas. Encerramentos forcados
+podem nao produzir o marcador final; o inicio seguinte registra se o marcador
+anterior foi observado.
+
+No `/health`, `checks.connection_diagnostics.version = "2026-10-12.1"` identifica
+a versao e informa persistencia, falhas e descartes. `checks.session_alerts`
+informa contagens de contas com quedas repetidas, em reconexao e precisando QR.
+Pressao de memoria (>768 MiB) ou atraso do processo (>1 segundo) gera evento
+`health_warning`, sem reiniciar sessoes saudaveis. Esses sinais ficam no diario
+e nos logs do Railway; esta versao nao envia notificacoes externas.
+
+### GET /api/diagnostics
+
+Exige o token interno, como as outras rotas sensiveis. Filtros opcionais:
+`sessionKey` (UUID da conta), `since` (data ISO) e `limit` (1 a 1000, padrao 200).
+Por padrao consulta o ultimo dia. Retorna `{ ok, journal, events }`; datas e
+arquivos usam UTC. Para diagnosticar uma conta, leia `session_closed`, os eventos
+de transporte e recuperacao proximos, depois `reconnect_scheduled` e
+`session_connected`. `downtime_ms` mede a interrupcao ate reabrir, inclusive
+entre tentativas consecutivas dentro do mesmo processo.
 
 ## Endpoints
 
@@ -242,8 +281,8 @@ x-bot-signature: BOT_INTERNAL_TOKEN
 ## Teste local
 
 ```bash
-cd railway/whatsapp-bot
-npm install
+npm ci
+npm test
 SUPABASE_URL=https://spbjyryzvzrqfpyiqsuy.supabase.co \
 SUPABASE_SERVICE_ROLE_KEY=... \
 BOT_INTERNAL_TOKEN=... \

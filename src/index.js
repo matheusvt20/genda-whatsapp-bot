@@ -36,8 +36,10 @@ import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
 import { prepareOutgoingAudio } from "./outgoing-audio.js";
 import { createCredentialSaver, restoreSessionCredentials } from "./session-auth.js";
-import { decideSessionDisconnect } from "./session-disconnect.js";
+import { decideSessionDisconnect, disconnectDiagnostics } from "./session-disconnect.js";
 import { createSessionLifecycle } from "./session-lifecycle.js";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { attachTransportDiagnostics, classifyConnectionClose, createConnectionJournal, createReconnectTracker } from "./connection-diagnostics.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -193,6 +195,73 @@ const INSTANCE_ID = randomUUID();
 const OUTBOUND_MESSAGE_CACHE_MAX = 1000;
 const STATUS_OUTBOX_PATH = path.join(SESSION_DIR, "whatsapp-status-outbox.json");
 const MESSAGE_STATUS_RANK = Object.freeze({ failed: 0, sent: 1, delivered: 2, read: 3, played: 4 });
+let isShuttingDown = false;
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+const reconnectTracker = createReconnectTracker();
+const sessionDisconnectTimes = new Map();
+const connectionJournal = createConnectionJournal({
+  directory: path.join(SESSION_DIR, "connection-diagnostics"),
+  instanceId: INSTANCE_ID,
+  deploymentId: process.env.RAILWAY_DEPLOYMENT_ID,
+  onEvent: (event) => console.info("[connection-diagnostic]", JSON.stringify(event)),
+  onError: () => console.error("[connection-diagnostic] journal persistence failed"),
+});
+let runtimeSample = {};
+let previousCpu = process.cpuUsage?.();
+let previousCpuAt = Date.now();
+
+function recordConnectionDiagnostic(type, sessionKey, details = {}) {
+  const session = sessions.get(sessionKey);
+  const now = Date.now();
+  const memory = process.memoryUsage();
+  return connectionJournal.record(type, sessionKey, {
+    ...runtimeSample,
+    rss_mb: memory.rss / 1048576,
+    heap_mb: memory.heapUsed / 1048576,
+    uptime_ms: process.uptime() * 1000,
+    connected_ms: session?.connectedAt ? now - session.connectedAt : undefined,
+    decrypt_errors: session?.decryptErrorTimestamps?.length || 0,
+    decrypt_errors_total: session?.decryptErrorsTotal || 0,
+    last_message_age_ms: session?.lastNotifyUpsertAt ? now - session.lastNotifyUpsertAt : undefined,
+    last_transport_age_ms: session?.lastTransportMessageAt ? now - session.lastTransportMessageAt : undefined,
+    state: session?.status,
+    ...details,
+  });
+}
+
+function sampleConnectionRuntime() {
+  if (isShuttingDown) return;
+  const now = Date.now();
+  const cpu = process.cpuUsage(previousCpu);
+  previousCpu = process.cpuUsage();
+  const memory = process.memoryUsage();
+  const values = [...sessions.values()];
+  runtimeSample = {
+    rss_mb: memory.rss / 1048576,
+    heap_mb: memory.heapUsed / 1048576,
+    event_loop_max_ms: loopDelay.max / 1000000,
+    cpu_percent: (cpu.user + cpu.system) / (Math.max(1, now - previousCpuAt) * 10),
+    uptime_ms: process.uptime() * 1000,
+    sessions_connected: values.filter((value) => value.status === "connected").length,
+    sessions_reconnecting: values.filter((value) => value.status === "reconnecting").length,
+    sessions_needing_qr: values.filter((value) => value.status === "needs_reconnect").length,
+    sessions_flapping: reconnectTracker.flappingCount(),
+  };
+  previousCpuAt = now;
+  loopDelay.reset();
+  recordConnectionDiagnostic("runtime_sample", null);
+  if (runtimeSample.event_loop_max_ms > 1000 || runtimeSample.rss_mb > 768) {
+    recordConnectionDiagnostic("health_warning", null, { reason: "resource_pressure" });
+  }
+}
+
+function endSessionInternally(session, reason) {
+  session.internalCloseReason = reason;
+  recordConnectionDiagnostic("internal_recovery", session.sessionKey, { reason });
+  try { session.sock?.end?.(new Error(session.lastError || "Genda session recovery")); }
+  catch { recordConnectionDiagnostic("event_handler_failed", session.sessionKey, { reason }); }
+}
+
 
 function requireInternalToken(req, res, next) {
   const token = req.get("authorization")?.replace(/^Bearer\s+/i, "") || req.get("x-bot-signature");
@@ -282,6 +351,7 @@ function resetSessionReconnectState(sessionKey) {
 function scheduleSessionReconnect(session, reason) {
   const { sessionKey } = session;
   clearSessionReconnectTimer(sessionKey);
+  if (isShuttingDown) return;
 
   const now = Date.now();
   if (shouldResetReconnectAttempts(session.connectedAt, now, RECONNECT_STABLE_RESET_MS)) {
@@ -290,12 +360,13 @@ function scheduleSessionReconnect(session, reason) {
 
   const attempt = (sessionReconnectAttempts.get(sessionKey) || 0) + 1;
   sessionReconnectAttempts.set(sessionKey, attempt);
-  const delayMs = computeReconnectDelayMs(attempt, {
+  const delayMs = Math.max(reconnectTracker.stats(sessionKey).delay_ms, computeReconnectDelayMs(attempt, {
     baseDelayMs: RECONNECT_BASE_DELAY_MS,
     maxDelayMs: RECONNECT_MAX_DELAY_MS,
     jitterMs: RECONNECT_JITTER_MS,
-  });
+  }));
 
+  recordConnectionDiagnostic("reconnect_scheduled", sessionKey, { attempt, delay_ms: delayMs, recent_closes: reconnectTracker.stats(sessionKey).recent_closes });
   console.warn("[bot] session reconnect scheduled", {
     sessionKey,
     attempt,
@@ -305,7 +376,9 @@ function scheduleSessionReconnect(session, reason) {
 
   const timer = setTimeout(() => {
     sessionReconnectTimers.delete(sessionKey);
+    if (isShuttingDown) return;
     void createSession(sessionKey).catch((error) => {
+      recordConnectionDiagnostic("reconnect_failed", sessionKey, { attempt });
       session.status = "error";
       session.lastError = error instanceof Error ? error.message : "reconnect failed";
       console.error("[bot] reconnect failed", { sessionKey, attempt, error });
@@ -333,6 +406,7 @@ function runSessionEvent(session, eventName, task) {
 
   void pending
     .catch((error) => {
+      recordConnectionDiagnostic("event_handler_failed", session.sessionKey);
       session.lastError = error instanceof Error ? error.message : String(error);
       console.error("[bot] baileys event handler failed", {
         sessionKey: session.sessionKey,
@@ -500,7 +574,7 @@ async function releaseAllSessionProcessLocks() {
   await Promise.all([...sessionProcessLocks.keys()].map((sessionKey) => releaseSessionProcessLock(sessionKey)));
 }
 
-async function clearStoredSessionAuth(sessionKey) {
+async function clearStoredSessionAuth(sessionKey, reason = "fresh_qr") {
   resetSessionReconnectState(sessionKey);
   sessions.delete(sessionKey);
   await sessionCredentialSavers.get(sessionKey)?.close();
@@ -514,6 +588,7 @@ async function clearStoredSessionAuth(sessionKey) {
     `/object/whatsapp-sessions/sessions/${sessionKey}/creds.json`,
     { method: "DELETE" },
   );
+  recordConnectionDiagnostic("auth_cleared", sessionKey, { reason, auth_cleared: true });
 }
 
 function toApiStatus(status) {
@@ -629,11 +704,7 @@ async function recoverStaleMessageListener(session) {
       lastNotifyUpsertAt: session.lastNotifyUpsertAt ? new Date(session.lastNotifyUpsertAt).toISOString() : null,
     });
 
-    try {
-      session.sock?.end?.(new Error(session.lastError));
-    } catch (error) {
-      console.warn("[bot] failed to end socket for message listener reconnect", error);
-    }
+    endSessionInternally(session, "listener_recovery");
 
     await syncConnectionStatus(session.sessionKey, "reconnecting", {
       phone: session.phone,
@@ -653,11 +724,7 @@ async function recoverStaleMessageListener(session) {
     lastNotifyUpsertAt: session.lastNotifyUpsertAt ? new Date(session.lastNotifyUpsertAt).toISOString() : null,
   });
 
-  try {
-    session.sock?.end?.(new Error(session.lastError));
-  } catch (error) {
-    console.warn("[bot] failed to end unhealthy message listener socket", error);
-  }
+  endSessionInternally(session, "listener_unhealthy");
 
   await syncConnectionStatus(session.sessionKey, "disconnected", {
     phone: session.phone,
@@ -1676,6 +1743,7 @@ function getDecryptRecovery(sessionKey, now = Date.now()) {
 }
 
 function recordDecryptError(session, obj, msg) {
+  if (session) session.decryptErrorsTotal = (session.decryptErrorsTotal || 0) + 1;
   if (!session || session.healthMarkedDisconnected || session.decryptRecoveryInProgress) return;
 
   const now = Date.now();
@@ -1720,11 +1788,7 @@ function recoverUnhealthyDecryptSession(session, obj, msg, now = Date.now()) {
       reason: msg || obj?.err?.message || obj?.error?.message || "decrypt_error",
     });
 
-    try {
-      session.sock?.end?.(new Error(session.lastError));
-    } catch (error) {
-      console.warn("[bot] failed to end socket for soft reconnect", error);
-    }
+    endSessionInternally(session, "decrypt_recovery");
 
     void syncConnectionStatus(session.sessionKey, "reconnecting", {
       phone: session.phone,
@@ -1744,11 +1808,7 @@ function recoverUnhealthyDecryptSession(session, obj, msg, now = Date.now()) {
     reason: msg || obj?.err?.message || obj?.error?.message || "decrypt_error",
   });
 
-  try {
-    session.sock?.end?.(new Error(session.lastError));
-  } catch (error) {
-    console.warn("[bot] failed to end unhealthy socket", error);
-  }
+  endSessionInternally(session, "decrypt_unhealthy");
 
   void syncConnectionStatus(session.sessionKey, "disconnected", {
     phone: session.phone,
@@ -1764,6 +1824,10 @@ function makeSessionLogger(session) {
 
   const log = (level, obj, msg) => {
     const decryptError = isSessionDecryptError(obj, msg);
+    if (msg === "stream errored out") {
+      const node = obj?.reasonNode || obj?.fullErrorNode;
+      recordConnectionDiagnostic("provider_stream_error", session.sessionKey, disconnectDiagnostics({ data: node }, Number(obj?.fullErrorNode?.attrs?.code)));
+    }
     if (decryptError) recordDecryptError(session, obj, msg);
     if (msg === "sending receipt for messages" && obj?.attrs?.type === "peer_msg") {
       recordLowLevelPeerSignal(session);
@@ -1898,6 +1962,7 @@ async function useSupabaseAuthState(sessionKey) {
 
   const source = await restoreSessionCredentials(localPath, downloadCreds);
   console.log("[auth] credentials loaded", { sessionKey, source });
+  recordConnectionDiagnostic("auth_loaded", sessionKey, { source });
   const { state, saveCreds: saveCredsLocal } = await useMultiFileAuthState(localPath);
   const saver = createCredentialSaver({
     saveLocal: saveCredsLocal,
@@ -1906,7 +1971,10 @@ async function useSupabaseAuthState(sessionKey) {
       const response = await uploadCreds(credentials);
       if (response === null) throw new Error("credentials backup failed");
     },
-    onBackupError: (attempt) => console.warn("[auth] credentials backup failed; retaining local auth", { sessionKey, attempt }),
+    onBackupError: (attempt) => {
+      recordConnectionDiagnostic("auth_backup_failed", sessionKey, { attempt });
+      console.warn("[auth] credentials backup failed; retaining local auth", { sessionKey, attempt });
+    },
     retryDelay: () => sleep(300),
   });
   sessionCredentialSavers.set(sessionKey, saver);
@@ -1917,6 +1985,7 @@ async function useSupabaseAuthState(sessionKey) {
 
 async function startSession(sessionKey) {
   ensureConfig();
+  recordConnectionDiagnostic("session_start", sessionKey);
 
   const processLock = await acquireSessionProcessLock(sessionKey);
 
@@ -1974,6 +2043,7 @@ async function startSession(sessionKey) {
     });
 
     session.sock = sock;
+    attachTransportDiagnostics(sock, session, recordConnectionDiagnostic);
     sock.ev.on("creds.update", () => {
       runSessionEvent(session, "creds.update", saveCreds);
     });
@@ -2003,6 +2073,9 @@ async function startSession(sessionKey) {
         sessionConflictAttempts.delete(sessionKey);
       }
       session.connectedAt = Date.now();
+      const disconnectedAt = sessionDisconnectTimes.get(sessionKey);
+      recordConnectionDiagnostic("session_connected", sessionKey, { state: "connected", downtime_ms: disconnectedAt ? Date.now() - disconnectedAt : undefined });
+      sessionDisconnectTimes.delete(sessionKey);
       await saveCreds();
       if (sessions.get(sessionKey) !== session) return;
       session.qr = null;
@@ -2044,6 +2117,13 @@ async function startSession(sessionKey) {
 
       if (connection === "close") {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if (isShuttingDown) {
+        recordConnectionDiagnostic("session_closed", sessionKey, { cause: "internal_action", reason: "process_shutdown", status_code: statusCode, auth_cleared: false, should_reconnect: false });
+        session.sock = null;
+        return; // Keep the DB connected state so the next deployment restores it.
+      }
+      if (!sessionDisconnectTimes.has(sessionKey)) sessionDisconnectTimes.set(sessionKey, Date.now());
+      if (statusCode !== 515) reconnectTracker.closed(sessionKey);
       const wasWaitingForQr = session.status === "qr_pending" || (!session.hasOpened && Boolean(session.qr));
       const markedUnhealthy = session.healthMarkedDisconnected || session.status === "needs_reconnect";
       if (shouldResetReconnectAttempts(session.connectedAt, Date.now(), RECONNECT_STABLE_RESET_MS)) {
@@ -2064,6 +2144,17 @@ async function startSession(sessionKey) {
         const attempts = (sessionConflictAttempts.get(sessionKey)?.attempts || 0) + 1;
         sessionConflictAttempts.set(sessionKey, { attempts, at: Date.now() });
       }
+      recordConnectionDiagnostic("session_closed", sessionKey, {
+        ...decision.diagnostics,
+        ...session.lastTransportError,
+        ...session.lastTransportClose,
+        cause: classifyConnectionClose({ internalReason: session.internalCloseReason, diagnostics: decision.diagnostics, transport: session.lastTransportClose || session.lastTransportError }),
+        reason: session.internalCloseReason,
+        state: decision.status,
+        auth_cleared: decision.clearAuth,
+        should_reconnect: shouldReconnect,
+        recent_closes: reconnectTracker.stats(sessionKey).recent_closes,
+      });
       session.lastDisconnectDiagnostics = decision.diagnostics;
       session.status = decision.status;
       session.sock = null;
@@ -2073,7 +2164,7 @@ async function startSession(sessionKey) {
       }
       if (decision.clearAuth) {
         session.authCleared = true;
-        await clearStoredSessionAuth(sessionKey);
+        await clearStoredSessionAuth(sessionKey, "revoked_auth");
       }
       console.log("[bot] session closed", {
         sessionKey,
@@ -2422,9 +2513,28 @@ async function sendManualMessage(req, res) {
   }
 }
 
+
+app.get("/api/diagnostics", requireInternalToken, async (req, res) => {
+  const sessionKey = String(req.query.sessionKey || "").trim();
+  const since = req.query.since ? Date.parse(String(req.query.since)) : Date.now() - 86400000;
+  const limit = req.query.limit ? Number(req.query.limit) : 200;
+  if ((sessionKey && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(sessionKey)) || !Number.isFinite(since) || !Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    return res.status(400).json({ ok: false, error: "invalid_diagnostic_filter" });
+  }
+  try {
+    await connectionJournal.flush();
+    const events = await connectionJournal.read({ sessionKey: sessionKey || null, since, limit });
+    res.json({ ok: true, journal: connectionJournal.health(), events });
+  } catch {
+    res.status(503).json({ ok: false, error: "diagnostics_unavailable" });
+  }
+});
+
 app.get("/health", async (_req, res) => {
   const checks = {};
   checks.session_recovery_version = "2026-10-12";
+  checks.connection_diagnostics = connectionJournal.health();
+  checks.session_alerts = { flapping: reconnectTracker.flappingCount(), needing_qr: [...sessions.values()].filter((session) => session.status === "needs_reconnect").length, reconnecting: [...sessions.values()].filter((session) => session.status === "reconnecting").length };
   let healthy = true;
 
   // 1. Checa variáveis de ambiente obrigatórias
@@ -2586,6 +2696,8 @@ app.post("/api/wipe", requireInternalToken, async (req, res) => {
   if (!sessionKey) return res.status(400).json({ success: false, error: "sessionKey required" });
 
   const session = sessions.get(sessionKey);
+  if (session) session.internalCloseReason = "api_wipe";
+  recordConnectionDiagnostic("manual_wipe", sessionKey, { reason: "api_wipe" });
   try {
     await session?.sock?.logout();
   } catch (error) {
@@ -2598,7 +2710,7 @@ app.post("/api/wipe", requireInternalToken, async (req, res) => {
 });
 
 async function runSessionHealthCheck() {
-  if (sessionHealthCheckRunning) return;
+  if (sessionHealthCheckRunning || isShuttingDown) return;
   sessionHealthCheckRunning = true;
 
   try {
@@ -2616,12 +2728,23 @@ async function runSessionHealthCheck() {
 async function startServer() {
   ensureConfig();
   await fs.mkdir(SESSION_DIR, { recursive: true });
+  await connectionJournal.initialize();
+  const previousEvents = await connectionJournal.read({ limit: 1000, since: Date.now() - 10 * 60000 }).catch(() => []);
+  const previous = previousEvents.at(-1);
+  for (const event of previousEvents) {
+    if (event.type === "session_closed" && event.details.status_code !== 515 && event.details.reason !== "process_shutdown") reconnectTracker.closed(event.session_key, Date.parse(event.at));
+  }
+  recordConnectionDiagnostic("process_started", null, { previous_shutdown_observed: previous ? previous.type === "process_shutdown" : undefined });
+  loopDelay.enable();
+  sampleConnectionRuntime();
+  await connectionJournal.flush();
   await loadStatusOutbox();
   void flushStatusOutbox();
 
   const server = app.listen(PORT, () => {
     console.log(`[bot] listening on ${PORT}`);
     console.log(`[bot] session dir: ${SESSION_DIR}`);
+    setInterval(sampleConnectionRuntime, 30000).unref?.();
     setInterval(() => {
       void runSessionHealthCheck();
     }, SESSION_HEALTH_CHECK_INTERVAL_MS).unref?.();
@@ -2644,6 +2767,16 @@ void startServer().catch((error) => {
 });
 
 async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  loopDelay.disable();
+  for (const session of sessions.values()) {
+    clearSessionReconnectTimer(session.sessionKey);
+    endSessionInternally(session, "process_shutdown");
+  }
+  await Promise.race([Promise.all([...sessions.values()].map((session) => session.runLifecycle(() => {}))), sleep(3000)]);
+  recordConnectionDiagnostic("process_shutdown", null, { reason: signal });
+  await Promise.race([connectionJournal.flush(), sleep(2000)]);
   console.log(`[bot] received ${signal}, releasing session locks`);
   await releaseAllSessionProcessLocks().catch((error) => {
     console.error("[bot] failed to release session locks during shutdown", error);
@@ -2682,6 +2815,7 @@ async function restoreAllSessions() {
 
     console.log(`[bot] auto-restore: restoring ${rows.length} session(s)`);
     for (const row of rows) {
+      if (isShuttingDown) break;
       const key = (row.user_id || row.session_key || "").trim();
       if (!key) continue;
 
