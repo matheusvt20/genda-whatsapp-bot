@@ -81,6 +81,23 @@ As reconexoes usam backoff exponencial com jitter. Isso impede que uma queda
 transitoria do WhatsApp crie varios sockets em sequencia, consuma CPU ou leve o
 Railway a encerrar o servico depois de repetidas falhas.
 
+As credenciais validas do volume sao a fonte principal para reconexao. O backup
+no Storage so e restaurado se o arquivo local estiver ausente ou invalido, para
+nao retroceder contadores de chaves enquanto os arquivos Signal permanecem mais
+recentes. Gravacoes de credenciais e eventos de conexao sao ordenados por sessao.
+Falhas no backup remoto preservam o estado local.
+
+Um `401` com `conflict` sem indicacao de `device_removed` recebe uma tentativa
+automatica de recuperacao, preservando a autorizacao. Conflito repetido exige
+acao do usuario e nao entra em loop. `device_removed` ou uma falha `401` sem
+conflito continuam encerrando uma autorizacao revogada. O campo
+`device_info.disconnect` registra apenas codigo, motivo e tipo de conflito,
+sem credenciais. O health identifica esta revisao por
+`checks.session_recovery_version = "2026-10-12"`.
+
+Para publicar este repositorio separado, use sua raiz como diretorio de deploy;
+o trecho `railway/whatsapp-bot` acima descreve apenas a antiga copia do monorepo.
+
 ## Endpoints
 
 Rotas sensiveis exigem:

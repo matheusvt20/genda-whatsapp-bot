@@ -4,7 +4,6 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import express from "express";
 import makeWASocket, {
-  DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
@@ -36,6 +35,9 @@ import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
 import { prepareOutgoingAudio } from "./outgoing-audio.js";
+import { createCredentialSaver, restoreSessionCredentials } from "./session-auth.js";
+import { decideSessionDisconnect } from "./session-disconnect.js";
+import { createSessionLifecycle } from "./session-lifecycle.js";
 
 const originalConsoleInfo = console.info.bind(console);
 console.info = (...args) => {
@@ -179,6 +181,8 @@ const sessionSendQueues = new Map();
 const outboundMessageCache = new Map();
 const sessionReconnectTimers = new Map();
 const sessionReconnectAttempts = new Map();
+const sessionCredentialSavers = new Map();
+const sessionConflictAttempts = new Map();
 const statusOutbox = new Map();
 let sessionHealthCheckRunning = false;
 let mediaCleanupRunning = false;
@@ -322,11 +326,12 @@ function runSessionEvent(session, eventName, task) {
     return;
   }
 
-  void Promise.resolve()
-    .then(() => {
-      if (sessions.get(session.sessionKey) !== session) return undefined;
-      return task();
-    })
+  const guardedTask = () => sessions.get(session.sessionKey) === session ? task() : undefined;
+  const pending = ["creds.update", "connection.update"].includes(eventName)
+    ? session.runLifecycle(guardedTask)
+    : Promise.resolve().then(guardedTask);
+
+  void pending
     .catch((error) => {
       session.lastError = error instanceof Error ? error.message : String(error);
       console.error("[bot] baileys event handler failed", {
@@ -498,6 +503,9 @@ async function releaseAllSessionProcessLocks() {
 async function clearStoredSessionAuth(sessionKey) {
   resetSessionReconnectState(sessionKey);
   sessions.delete(sessionKey);
+  await sessionCredentialSavers.get(sessionKey)?.close();
+  sessionCredentialSavers.delete(sessionKey);
+  sessionConflictAttempts.delete(sessionKey);
   decryptRecoveryState.delete(sessionKey);
   messageListenerRecoveryState.delete(sessionKey);
   await releaseSessionProcessLock(sessionKey);
@@ -1628,6 +1636,7 @@ async function syncConnectionStatus(sessionKey, status, extra = {}) {
       api_status: toApiStatus(status),
       last_error: extra.lastError || null,
       health_reason: extra.healthReason || null,
+      disconnect: extra.disconnect || null,
     },
     updated_at: new Date().toISOString(),
   };
@@ -1869,8 +1878,9 @@ async function useSupabaseAuthState(sessionKey) {
   const localPath = sessionPath(sessionKey);
 
   async function uploadCreds(data) {
-    await supabaseStorageFetch(`/object/${BUCKET}/${remotePrefix}/creds.json`, {
+    return supabaseStorageFetch(`/object/${BUCKET}/${remotePrefix}/creds.json`, {
       method: "POST",
+      signal: AbortSignal.timeout(5000),
       headers: {
         "Content-Type": "application/json",
         "x-upsert": "true",
@@ -1882,59 +1892,25 @@ async function useSupabaseAuthState(sessionKey) {
   async function downloadCreds() {
     return supabaseStorageFetch(`/object/${BUCKET}/${remotePrefix}/creds.json`, {
       method: "GET",
+      signal: AbortSignal.timeout(5000),
     });
   }
 
-  // Tenta restaurar creds do Storage para o cache local
-  await fs.mkdir(localPath, { recursive: true });
-
-  const remoteCreds = await downloadCreds();
-  if (remoteCreds) {
-    await fs.writeFile(
-      path.join(localPath, "creds.json"),
-      typeof remoteCreds === "string" ? remoteCreds : JSON.stringify(remoteCreds),
-    );
-    console.log("[auth] creds restaurados do Supabase Storage", { sessionKey });
-  }
-
-  // Inicializa com filesystem local normalmente
+  const source = await restoreSessionCredentials(localPath, downloadCreds);
+  console.log("[auth] credentials loaded", { sessionKey, source });
   const { state, saveCreds: saveCredsLocal } = await useMultiFileAuthState(localPath);
-
-  // saveCreds salva local + Storage
-  async function saveCreds() {
-    await saveCredsLocal();
-
-    // Retry com delay para garantir que o arquivo foi escrito completamente
-    let attempts = 0;
-    const maxAttempts = 3;
-
-    while (attempts < maxAttempts) {
-      try {
-        await new Promise(resolve => setTimeout(resolve, 300));
-        const credsRaw = await fs.readFile(path.join(localPath, "creds.json"), "utf-8");
-
-        // Valida JSON antes de enviar
-        const parsed = JSON.parse(credsRaw);
-        if (!parsed || !parsed.noiseKey) {
-          throw new Error("creds.json incompleto ou inválido");
-        }
-
-        await uploadCreds(parsed);
-        console.log("[auth] creds salvos no Storage com sucesso", { sessionKey });
-        return;
-      } catch (e) {
-        attempts++;
-        console.warn("[auth] tentativa falhou ao salvar creds no Storage", {
-          sessionKey,
-          attempt: attempts,
-          error: e.message,
-        });
-        if (attempts >= maxAttempts) {
-          console.error("[auth] desistindo após 3 tentativas", { sessionKey });
-        }
-      }
-    }
-  }
+  const saver = createCredentialSaver({
+    saveLocal: saveCredsLocal,
+    readLocal: () => fs.readFile(path.join(localPath, "creds.json"), "utf8"),
+    upload: async (credentials) => {
+      const response = await uploadCreds(credentials);
+      if (response === null) throw new Error("credentials backup failed");
+    },
+    onBackupError: (attempt) => console.warn("[auth] credentials backup failed; retaining local auth", { sessionKey, attempt }),
+    retryDelay: () => sleep(300),
+  });
+  sessionCredentialSavers.set(sessionKey, saver);
+  const saveCreds = () => saver.save();
 
   return { state, saveCreds };
 }
@@ -1974,6 +1950,7 @@ async function startSession(sessionKey) {
       appointmentSyncStarted: false,
       avatarBackfillRunning: false,
     };
+    session.runLifecycle = createSessionLifecycle(() => sessions.get(sessionKey) === session);
     sessions.set(sessionKey, session);
 
     const logger = makeSessionLogger(session);
@@ -2021,8 +1998,13 @@ async function startSession(sessionKey) {
 
       if (connection === "open") {
       session.status = "connected";
+      const previousConflict = sessionConflictAttempts.get(sessionKey);
+      if (previousConflict && Date.now() - previousConflict.at >= RECONNECT_STABLE_RESET_MS) {
+        sessionConflictAttempts.delete(sessionKey);
+      }
       session.connectedAt = Date.now();
       await saveCreds();
+      if (sessions.get(sessionKey) !== session) return;
       session.qr = null;
       session.hasOpened = true;
       session.healthMarkedDisconnected = false;
@@ -2062,23 +2044,34 @@ async function startSession(sessionKey) {
 
       if (connection === "close") {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      const restartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
       const wasWaitingForQr = session.status === "qr_pending" || (!session.hasOpened && Boolean(session.qr));
       const markedUnhealthy = session.healthMarkedDisconnected || session.status === "needs_reconnect";
-      const recoveringFromDecryptError = session.decryptRecoveryInProgress && !loggedOut && !markedUnhealthy;
-      const shouldReconnect = recoveringFromDecryptError || (!markedUnhealthy && !loggedOut && (restartRequired || (!wasWaitingForQr && session.hasOpened)));
-
-      session.status = markedUnhealthy ? "needs_reconnect" : (shouldReconnect ? "reconnecting" : "disconnected");
+      if (shouldResetReconnectAttempts(session.connectedAt, Date.now(), RECONNECT_STABLE_RESET_MS)) {
+        sessionConflictAttempts.delete(sessionKey);
+      }
+      const decision = decideSessionDisconnect({
+        error: lastDisconnect?.error,
+        statusCode,
+        hasOpened: session.hasOpened,
+        hadStoredAuth,
+        wasWaitingForQr,
+        markedUnhealthy,
+        recoveringFromDecryptError: session.decryptRecoveryInProgress,
+        conflictAttempts: sessionConflictAttempts.get(sessionKey)?.attempts || 0,
+      });
+      const { loggedOut, restartRequired, shouldReconnect } = decision;
+      if (decision.ambiguousConflict && shouldReconnect) {
+        const attempts = (sessionConflictAttempts.get(sessionKey)?.attempts || 0) + 1;
+        sessionConflictAttempts.set(sessionKey, { attempts, at: Date.now() });
+      }
+      session.lastDisconnectDiagnostics = decision.diagnostics;
+      session.status = decision.status;
       session.sock = null;
       session.lastError = lastDisconnect?.error?.message || null;
       if (!shouldReconnect) {
         session.qr = null;
       }
-      if (loggedOut) {
-        session.authCleared = true;
-        await clearStoredSessionAuth(sessionKey);
-      } else if (markedUnhealthy) {
+      if (decision.clearAuth) {
         session.authCleared = true;
         await clearStoredSessionAuth(sessionKey);
       }
@@ -2092,17 +2085,24 @@ async function startSession(sessionKey) {
         wasWaitingForQr,
         shouldReconnect,
         error: session.lastError,
+        disconnect: decision.diagnostics,
+        authCleared: decision.clearAuth,
       });
-      await syncConnectionStatus(sessionKey, session.status, { phone: session.phone, lastError: session.lastError });
+      try {
+        await syncConnectionStatus(sessionKey, session.status, {
+          phone: session.phone,
+          lastError: session.lastError,
+          disconnect: decision.diagnostics,
+        });
+      } finally {
+        if (shouldReconnect) scheduleSessionReconnect(session, `connection_close_${statusCode || "unknown"}`);
+      }
 
       if (!shouldReconnect) {
         resetSessionReconnectState(sessionKey);
         await releaseSessionProcessLock(sessionKey);
       }
 
-      if (shouldReconnect) {
-        scheduleSessionReconnect(session, `connection_close_${statusCode || "unknown"}`);
-      }
       }
     });
   });
@@ -2424,6 +2424,7 @@ async function sendManualMessage(req, res) {
 
 app.get("/health", async (_req, res) => {
   const checks = {};
+  checks.session_recovery_version = "2026-10-12";
   let healthy = true;
 
   // 1. Checa variáveis de ambiente obrigatórias
@@ -2666,7 +2667,7 @@ async function restoreAllSessions() {
 
   try {
     const response = await supabaseFetch(
-      "/whatsapp_connections?status=eq.connected&select=user_id,session_key",
+      "/whatsapp_connections?status=in.(connected,waiting)&select=user_id,session_key",
     );
     if (!response?.ok) {
       console.warn("[bot] auto-restore: failed to fetch connections", response?.status);
