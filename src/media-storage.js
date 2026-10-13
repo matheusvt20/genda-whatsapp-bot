@@ -1,3 +1,4 @@
+import { supabaseHeaders } from "./supabase-headers.js";
 import { randomUUID } from "node:crypto";
 
 export const DEFAULT_MEDIA_RETENTION_MS = 15 * 24 * 60 * 60 * 1000;
@@ -59,8 +60,7 @@ export function createMediaStorage({
   const signedUrlTtlSeconds = Math.max(60, Math.ceil(retention / 1000));
 
   const headers = (extra = {}) => ({
-    apikey: serviceRoleKey,
-    authorization: `Bearer ${serviceRoleKey}`,
+    ...supabaseHeaders(serviceRoleKey),
     ...extra,
   });
 

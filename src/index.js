@@ -1,3 +1,4 @@
+import { supabaseHeaders } from "./supabase-headers.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -165,6 +166,12 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.status(204).end();
   return next();
+});
+app.disable("x-powered-by");
+// Authenticate private requests before parsing a potentially large JSON body.
+app.use("/api", (req, res, next) => {
+  if (req.method === "GET" && req.path.startsWith("/media/")) return next();
+  return requireInternalToken(req, res, next);
 });
 app.use(express.json({ limit: "16mb" }));
 
@@ -1660,8 +1667,7 @@ async function supabaseFetch(pathname, options = {}) {
   return fetch(`${SUPABASE_URL}/rest/v1${pathname}`, {
     ...options,
     headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      ...supabaseHeaders(SUPABASE_SERVICE_ROLE_KEY),
       "content-type": "application/json",
       ...(options.headers || {}),
     },
@@ -1674,8 +1680,7 @@ async function supabaseStorageFetch(pathname, options = {}) {
   const res = await fetch(`${SUPABASE_URL}/storage/v1${pathname}`, {
     ...options,
     headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      ...supabaseHeaders(SUPABASE_SERVICE_ROLE_KEY),
       ...(options.headers || {}),
     },
   });

@@ -14,6 +14,7 @@ import * as lifecycle from "../src/session-lifecycle.js";
 import * as disconnect from "../src/session-disconnect.js";
 import * as reconnect from "../src/reconnect-policy.js";
 import * as phone from "../src/phone.js";
+import { supabaseHeaders } from "../src/supabase-headers.js";
 import * as diagnostics from "../src/connection-diagnostics.js";
 
 // Exercise the real index.js handlers with a fake provider and HTTP transport.
@@ -28,7 +29,8 @@ async function runtime(t, options = {}) {
   initial.state.creds.nextPreKeyId = 99;
   await initial.saveCreds();
   const routes = new Map();
-  const app = { use() {}, get(route, ...handlers) { routes.set(route, handlers); }, post() {} };
+  const middlewares=[];
+  const app = { disable() {}, use(...args) { middlewares.push(args); }, get(route, ...handlers) { routes.set(route, handlers); }, post() {} };
   const express = Object.assign(() => app, { json: () => () => {} });
   let source = await fs.readFile(new URL("../src/index.js", import.meta.url), "utf8");
   source = source.slice(source.indexOf("const originalConsoleInfo"));
@@ -37,7 +39,7 @@ async function runtime(t, options = {}) {
   source += "\nglobalThis.runtime = { createSession, clearStoredSessionAuth, sessions, resetSessionReconnectState, restoreAllSessions, connectionJournal, reconnectTracker, shutdown, endSessionInternally };";
   const context = vm.createContext({
     ...auth, ...lifecycle, ...disconnect, ...reconnect, ...phone, ...diagnostics,
-    monitorEventLoopDelay,
+    monitorEventLoopDelay, supabaseHeaders,
     fs, path, randomUUID, Boom, express,
     createMediaStorage: () => ({}), DEFAULT_MEDIA_RETENTION_MS: 15 * 24 * 60 * 60 * 1000,
     useMultiFileAuthState,
@@ -63,7 +65,7 @@ async function runtime(t, options = {}) {
   const api = context.runtime;
   t.after(async () => { await api.clearStoredSessionAuth("customer"); await api.connectionJournal.flush(); await fs.rm(directory, { recursive: true, force: true }); });
   const session = await api.createSession("customer");
-  return { api, session, sockets, requests, local, routes };
+  return { api, session, sockets, requests, local, routes, middlewares };
 }
 
 test("real reconnect handler retains local auth for the historical 401 conflict", async (t) => {
@@ -198,4 +200,12 @@ test("diagnostics route requires the internal token and rejects invalid filters"
   await handler({ query: {} }, res);
   assert.equal(body.ok, true);
   assert.ok(Array.isArray(body.events));
+});
+
+test("private API rejects credentials before processing its JSON body while a valid backend remains allowed",async(t)=>{
+ const { middlewares }=await runtime(t);const gate=middlewares.find(([route])=>route==="/api")[1];
+ let status=0,next=false;const response={status(value){status=value;return this;},json(){return this;}};
+ gate({method:"POST",path:"/message/send",get:()=>undefined},response,()=>{next=true;});
+ assert.equal(status,401);assert.equal(next,false);
+ gate({method:"POST",path:"/message/send",get:()=>"Bearer fixture"},response,()=>{next=true;});assert.equal(next,true);
 });

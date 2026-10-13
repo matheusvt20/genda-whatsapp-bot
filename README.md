@@ -26,7 +26,7 @@ Mount path: /data
 
 ```txt
 SUPABASE_URL=https://spbjyryzvzrqfpyiqsuy.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=... # accepts modern sb_secret keys (recommended) or legacy JWT
 BOT_INTERNAL_TOKEN=...
 PORT=3000
 SESSION_DIR=/data
@@ -284,7 +284,7 @@ x-bot-signature: BOT_INTERNAL_TOKEN
 npm ci
 npm test
 SUPABASE_URL=https://spbjyryzvzrqfpyiqsuy.supabase.co \
-SUPABASE_SERVICE_ROLE_KEY=... \
+SUPABASE_SERVICE_ROLE_KEY=... # accepts modern sb_secret keys (recommended) or legacy JWT \
 BOT_INTERNAL_TOKEN=... \
 SESSION_DIR=/tmp/genda-whatsapp-sessions \
 npm start
