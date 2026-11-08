@@ -1,3 +1,4 @@
+import { createMessageDeliveryTracker } from "./message-delivery.js";
 import { supabaseHeaders } from "./supabase-headers.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -178,7 +179,7 @@ app.use(express.json({ limit: "16mb" }));
 const sessions = new Map();
 const sessionStartPromises = new Map();
 const sessionProcessLocks = new Map();
-const processedMessageIds = new Set();
+const messageDelivery = createMessageDeliveryTracker();
 const processedStatusUpdates = new Set();
 const mediaMessages = new Map();
 const pipelineContactCache = new Map();
@@ -753,18 +754,6 @@ async function getRestoredSession(sessionKey) {
   return createSession(sessionKey);
 }
 
-function rememberMessage(id) {
-  if (!id) return false;
-  if (processedMessageIds.has(id)) return true;
-
-  processedMessageIds.add(id);
-  if (processedMessageIds.size > 5000) {
-    const first = processedMessageIds.values().next().value;
-    processedMessageIds.delete(first);
-  }
-
-  return false;
-}
 
 function rememberStatusUpdate(id) {
   if (!id) return false;
@@ -1446,39 +1435,40 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
     }
     return false;
   }
-  if (rememberMessage(dedupeKey)) {
-    if (source === "notify") console.log("[bot] live message ignored", { reason: "duplicate", hasMessageId: Boolean(messageId) });
-    return false;
-  }
+  const forwarded = await messageDelivery.forward(dedupeKey, adContext, async () => {
 
-  const [groupDetails, contactAvatarUrl] = await Promise.all([
-    isGroup ? groupDetailsFromMessage(session, jid) : Promise.resolve(null),
-    resolveContactAvatarUrl(session, jid),
-  ]);
+    const [groupDetails, contactAvatarUrl] = await Promise.all([
+      isGroup ? groupDetailsFromMessage(session, jid) : Promise.resolve(null),
+      resolveContactAvatarUrl(session, jid),
+    ]);
 
-  await postInboundEvent({
-    session_key: session.sessionKey,
-    message_id: messageId,
-    whatsapp_message_id: messageId,
-    whatsapp_jid: jid,
-    is_group: isGroup,
-    group_jid: isGroup ? jid : null,
-    group_subject: groupDetails?.subject ?? null,
-    group_participant_count: groupDetails?.participantCount ?? null,
-    participant_jid: isGroup ? message?.key?.participant || message?.key?.participantAlt || null : null,
-    contact_phone: contactPhone,
-    contact_name: fromMe ? null : message.pushName || null,
-    contact_avatar_url: contactAvatarUrl,
-    body: body?.trim() || null,
-    media_url: mediaUrl,
-    message_type: messageType,
-    timestamp: parseMessageTimestamp(message.messageTimestamp),
-    direction: fromMe ? "outbound" : "inbound",
-    // Só quando a mensagem veio de um anúncio "Enviar mensagem"; sem anúncio o payload fica igual ao de antes.
-    ...(adContext ? { ad_context: adContext } : {}),
+    await postInboundEvent({
+      session_key: session.sessionKey,
+      message_id: messageId,
+      whatsapp_message_id: messageId,
+      whatsapp_jid: jid,
+      is_group: isGroup,
+      group_jid: isGroup ? jid : null,
+      group_subject: groupDetails?.subject ?? null,
+      group_participant_count: groupDetails?.participantCount ?? null,
+      participant_jid: isGroup ? message?.key?.participant || message?.key?.participantAlt || null : null,
+      contact_phone: contactPhone,
+      contact_name: fromMe ? null : message.pushName || null,
+      contact_avatar_url: contactAvatarUrl,
+      body: body?.trim() || null,
+      media_url: mediaUrl,
+      message_type: messageType,
+      timestamp: parseMessageTimestamp(message.messageTimestamp),
+      direction: fromMe ? "outbound" : "inbound",
+      // Só quando a mensagem veio de um anúncio "Enviar mensagem"; sem anúncio o payload fica igual ao de antes.
+      ...(adContext ? { ad_context: adContext } : {}),
+    });
+
   });
-
-  return true;
+  if (!forwarded && source === "notify") {
+    console.log("[bot] live message ignored", { reason: "duplicate", hasMessageId: Boolean(messageId) });
+  }
+  return forwarded;
 }
 
 function isRecentSessionMessage(session, message) {

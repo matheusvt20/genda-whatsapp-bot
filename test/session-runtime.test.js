@@ -16,6 +16,8 @@ import * as reconnect from "../src/reconnect-policy.js";
 import * as phone from "../src/phone.js";
 import { supabaseHeaders } from "../src/supabase-headers.js";
 import * as diagnostics from "../src/connection-diagnostics.js";
+import { createMessageDeliveryTracker } from "../src/message-delivery.js";
+import * as messageContent from "../src/message-content.js";
 
 // Exercise the real index.js handlers with a fake provider and HTTP transport.
 // No production auth, WhatsApp traffic, database writes or server startup.
@@ -36,9 +38,9 @@ async function runtime(t, options = {}) {
   source = source.slice(source.indexOf("const originalConsoleInfo"));
   const startup = source.indexOf("void startServer().catch");
   source = source.slice(0, startup) + source.slice(source.indexOf("async function shutdown", startup));
-  source += "\nglobalThis.runtime = { createSession, clearStoredSessionAuth, sessions, resetSessionReconnectState, restoreAllSessions, connectionJournal, reconnectTracker, shutdown, endSessionInternally };";
+  source += "\nglobalThis.runtime = { createSession, clearStoredSessionAuth, sessions, resetSessionReconnectState, restoreAllSessions, connectionJournal, reconnectTracker, shutdown, endSessionInternally, forwardWhatsAppMessage };";
   const context = vm.createContext({
-    ...auth, ...lifecycle, ...disconnect, ...reconnect, ...phone, ...diagnostics,
+    ...auth, ...lifecycle, ...disconnect, ...reconnect, ...phone, ...diagnostics, ...messageContent, createMessageDeliveryTracker,
     monitorEventLoopDelay, supabaseHeaders,
     fs, path, randomUUID, Boom, express,
     createMediaStorage: () => ({}), DEFAULT_MEDIA_RETENTION_MS: 15 * 24 * 60 * 60 * 1000,
@@ -208,4 +210,17 @@ test("private API rejects credentials before processing its JSON body while a va
  gate({method:"POST",path:"/message/send",get:()=>undefined},response,()=>{next=true;});
  assert.equal(status,401);assert.equal(next,false);
  gate({method:"POST",path:"/message/send",get:()=>"Bearer fixture"},response,()=>{next=true;});assert.equal(next,true);
+});
+
+test("real inbound handler forwards late ad metadata for an existing ID without replaying ordinary duplicates", async t => {
+  const {api,session,requests} = await runtime(t);
+  const base = {key:{id:"ad-late",remoteJid:"5511888888888@s.whatsapp.net",fromMe:false},pushName:"Contato",messageTimestamp:Math.floor(Date.now()/1000)};
+  assert.equal(await api.forwardWhatsAppMessage(session,{...base,message:{conversation:"Olá"}}),true);
+  const enriched={...base,message:{extendedTextMessage:{text:"Olá",contextInfo:{externalAdReply:{sourceId:"ad-1",sourceType:"ad",title:"Anúncio"}}}}};
+  assert.equal(await api.forwardWhatsAppMessage(session,enriched),true);
+  assert.equal(await api.forwardWhatsAppMessage(session,enriched),false);
+  const sent=requests.filter(r=>r.url.endsWith("/whatsapp-inbound-webhook"));
+  assert.equal(sent.length,2);
+  assert.equal(JSON.parse(sent[0].body).ad_context,undefined);
+  assert.equal(JSON.parse(sent[1].body).ad_context.source_id,"ad-1");
 });
