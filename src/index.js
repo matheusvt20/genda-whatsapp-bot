@@ -3,7 +3,7 @@ import { supabaseHeaders } from "./supabase-headers.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { transcodeVoiceAudio, VOICE_AUDIO_PROFILE_VERSION } from "./audio-transcoder.js";
 import express from "express";
 import makeWASocket, {
   downloadMediaMessage,
@@ -36,7 +36,7 @@ import {
 import { createMediaStorage, DEFAULT_MEDIA_RETENTION_MS } from "./media-storage.js";
 import { assertMessageStatusWebhookAccepted } from "./message-status.js";
 import { computeStatusOutboxRetryDelay, shouldRetainStatusOutboxEntry } from "./status-outbox.js";
-import { prepareOutgoingAudio } from "./outgoing-audio.js";
+import { prepareVoiceNote } from "./voice-waveform.js";
 import { createCredentialSaver, restoreSessionCredentials } from "./session-auth.js";
 import { decideSessionDisconnect, disconnectDiagnostics } from "./session-disconnect.js";
 import { createSessionLifecycle } from "./session-lifecycle.js";
@@ -288,62 +288,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function transcodeAudioToOggOpus(input) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-vn",
-      "-c:a", "libopus",
-      "-b:a", "48k",
-      "-ac", "1",
-      "-ar", "48000",
-      "-f", "ogg",
-      "pipe:1",
-    ], { stdio: ["pipe", "pipe", "pipe"] });
-    const output = [];
-    const errors = [];
-    let settled = false;
-    const finish = (error, buffer) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (error) reject(error);
-      else resolve(buffer);
-    };
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      const error = new Error("audio conversion timed out");
-      error.code = "AUDIO_CONVERSION_TIMEOUT";
-      error.httpStatus = 503;
-      finish(error);
-    }, AUDIO_TRANSCODE_TIMEOUT_MS);
-
-    child.on("error", (cause) => {
-      const error = new Error("audio transcoder is unavailable");
-      error.code = "AUDIO_TRANSCODER_UNAVAILABLE";
-      error.httpStatus = 503;
-      error.cause = cause;
-      finish(error);
-    });
-    child.stdout.on("data", (chunk) => output.push(chunk));
-    child.stderr.on("data", (chunk) => errors.push(chunk));
-    child.on("close", (code) => {
-      if (settled) return;
-      if (code !== 0) {
-        const error = new Error("audio conversion failed");
-        error.code = "AUDIO_CONVERSION_FAILED";
-        error.httpStatus = 422;
-        error.details = Buffer.concat(errors).toString("utf8").slice(0, 500);
-        finish(error);
-        return;
-      }
-      finish(null, Buffer.concat(output));
-    });
-    child.stdin.on("error", (error) => finish(error));
-    child.stdin.end(input);
-  });
-}
+const transcodeAudioToOggOpus = input => transcodeVoiceAudio(input, { timeoutMs: AUDIO_TRANSCODE_TIMEOUT_MS });
 
 function clearSessionReconnectTimer(sessionKey) {
   const timer = sessionReconnectTimers.get(sessionKey);
@@ -2460,10 +2405,10 @@ async function sendManualMessage(req, res) {
       if (mediaType === "image") {
         payload = { image: buffer, caption: text || undefined, mimetype: mimeType };
       } else if (mediaType === "audio") {
-        const preparedAudio = await prepareOutgoingAudio(buffer, transcodeAudioToOggOpus);
-        mediaBuffer = preparedAudio.buffer;
-        outboundMimeType = preparedAudio.mimeType;
-        payload = { audio: mediaBuffer, mimetype: outboundMimeType, ptt: true };
+        const voice = await prepareVoiceNote(buffer, transcodeAudioToOggOpus);
+        mediaBuffer = voice.prepared.buffer;
+        outboundMimeType = voice.prepared.mimeType;
+        payload = voice.payload;
       } else if (mediaType === "video") {
         payload = { video: buffer, caption: text || undefined, mimetype: mimeType };
       } else {
@@ -2528,6 +2473,7 @@ app.get("/api/diagnostics", requireInternalToken, async (req, res) => {
 app.get("/health", async (_req, res) => {
   const checks = {};
   checks.session_recovery_version = "2026-10-12";
+  checks.voice_audio_profile_version = VOICE_AUDIO_PROFILE_VERSION;
   checks.connection_diagnostics = connectionJournal.health();
   checks.session_alerts = { flapping: reconnectTracker.flappingCount(), needing_qr: [...sessions.values()].filter((session) => session.status === "needs_reconnect").length, reconnecting: [...sessions.values()].filter((session) => session.status === "reconnecting").length };
   let healthy = true;

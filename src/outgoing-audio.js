@@ -19,12 +19,12 @@ export function isOggOpus(buffer) {
  * but convert every other browser or attachment format before it reaches
  * Baileys. The injected transcoder keeps this behavior independently testable.
  */
-export async function prepareOutgoingAudio(buffer, transcodeToOggOpus) {
+export async function prepareOutgoingAudio(buffer, transcodeToOggOpus, { normalize = false } = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw audioPreparationError("INVALID_AUDIO", "audio file is empty");
   }
 
-  if (isOggOpus(buffer)) {
+  if (!normalize && isOggOpus(buffer)) {
     return { buffer, mimeType: WHATSAPP_OPUS_MIME_TYPE, transcoded: false };
   }
 
