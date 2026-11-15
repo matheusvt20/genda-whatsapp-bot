@@ -1,3 +1,5 @@
+export const CATALOG_REFERENCE_VERSION = "catalog-reply-2026-11-14-1";
+
 import { extractMessageContent as extractBaileysMessageContent } from "@whiskeysockets/baileys";
 
 export function unwrapMessageContent(message) {
@@ -31,6 +33,7 @@ export function extractMessageText(message) {
     inner.listResponseMessage?.title ||
     inner.templateButtonReplyMessage?.selectedDisplayText ||
     inner.interactiveResponseMessage?.body?.text ||
+    catalogProductText(inner.productMessage) ||
     null
   );
 }
@@ -50,7 +53,8 @@ export function extractMessageType(message) {
     inner.buttonsResponseMessage ||
     inner.listResponseMessage ||
     inner.templateButtonReplyMessage ||
-    inner.interactiveResponseMessage
+    inner.interactiveResponseMessage ||
+    inner.productMessage
   ) {
     return "text";
   }
@@ -123,5 +127,32 @@ export function extractAdContext(message) {
     return Object.values(context).some(Boolean) ? context : null;
   }
 
+  return null;
+}
+
+
+// Valores do cartão são referência recebida, não o preço atual do cadastro Genda.
+export function catalogProductText(message) {
+  const product=message?.product;
+  const title=String(product?.title||'').replace(/[\r\n\u0000-\u001f]+/g,' ').trim().slice(0,240);
+  if(!title)return null;
+  const lines=['[Catálogo WhatsApp]',`Produto: ${title}`];
+  const id=String(product.productId||'').replace(/[\r\n\u0000-\u001f]+/g,' ').slice(0,100);
+  if(id)lines.push(`ID do produto: ${id}`);
+  const raw=String(product.priceAmount1000??'');
+  const currency=String(product.currencyCode||'');
+  if(/^\d{1,15}$/.test(raw)&&/^[A-Z]{3}$/.test(currency))lines.push(`Preço do cartão: ${currency} ${(Number(raw)/1000).toFixed(2)}`);
+  return lines.join('\n');
+}
+export function extractQuotedMessage(message) {
+  const inner=unwrapMessageContent(message);
+  if(!inner)return null;
+  for(const value of Object.values(inner)){
+    const info=value&&typeof value==='object'?value.contextInfo:null;
+    const id=String(info?.stanzaId||'').trim();
+    if(!id||!info?.quotedMessage)continue;
+    const quoted={message:info.quotedMessage};
+    return {messageId:id,body:extractMessageText(quoted)?.trim()||null,messageType:extractMessageType(quoted),participantJid:String(info.participant||'').trim()||null};
+  }
   return null;
 }

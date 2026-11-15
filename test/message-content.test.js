@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   extractAdContext,
+  extractQuotedMessage,
   extractMediaInfo,
   extractMessageText,
   extractMessageType,
@@ -132,4 +133,19 @@ test("returns no ad context for a regular message or an oversized thumbnail", ()
   };
   assert.equal(extractAdContext(message).thumbnail_data, null);
   assert.equal(extractAdContext(message).title, "Anúncio");
+});
+
+
+test('Leticia: reply ao produto mantém texto da cliente e referência Efeito Fox com preço do cartão',()=>{
+ const product={productMessage:{product:{productId:'fox-id',title:'Efeito Fox',currencyCode:'BRL',priceAmount1000:{toString:()=> '200000'}}}};
+ const message={message:{extendedTextMessage:{text:'Quero fazer esse',contextInfo:{stanzaId:'catalog-message',participant:'business@s.whatsapp.net',quotedMessage:product}}}};
+ assert.equal(extractMessageText(message),'Quero fazer esse');
+ assert.deepEqual(extractQuotedMessage(message),{messageId:'catalog-message',participantJid:'business@s.whatsapp.net',messageType:'text',body:'[Catálogo WhatsApp]\nProduto: Efeito Fox\nID do produto: fox-id\nPreço do cartão: BRL 200.00'});
+ assert.equal(extractMessageType({message:product}),'text');
+});
+test('reply comum, texto sem reply e produto sem título continuam seguros',()=>{
+ assert.equal(extractQuotedMessage({message:{conversation:'Oi'}}),null);
+ assert.equal(extractMessageText({message:{productMessage:{product:{productId:'id'}}}}),null);
+ const quoted=extractQuotedMessage({message:{extendedTextMessage:{text:'Sim',contextInfo:{stanzaId:'q',quotedMessage:{conversation:'Prefere manhã?'}}}}});
+ assert.equal(quoted.body,'Prefere manhã?');assert.equal(quoted.messageType,'text');
 });

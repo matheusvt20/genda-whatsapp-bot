@@ -14,7 +14,9 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import {
+  CATALOG_REFERENCE_VERSION,
   extractAdContext,
+  extractQuotedMessage,
   extractMediaInfo,
   extractMessageText,
   extractMessageType,
@@ -1407,6 +1409,10 @@ async function forwardWhatsAppMessage(session, message, source = "notify") {
       direction: fromMe ? "outbound" : "inbound",
       // Só quando a mensagem veio de um anúncio "Enviar mensagem"; sem anúncio o payload fica igual ao de antes.
       ...(adContext ? { ad_context: adContext } : {}),
+      ...(() => { const quoted=extractQuotedMessage(message);return quoted ? {
+        quoted_message_id:quoted.messageId,quoted_body:quoted.body,
+        quoted_message_type:quoted.messageType,quoted_participant_jid:quoted.participantJid,
+      } : {}; })(),
     });
 
   });
@@ -2474,6 +2480,7 @@ app.get("/health", async (_req, res) => {
   const checks = {};
   checks.session_recovery_version = "2026-10-12";
   checks.voice_audio_profile_version = VOICE_AUDIO_PROFILE_VERSION;
+  checks.catalog_reply_context_version = CATALOG_REFERENCE_VERSION;
   checks.connection_diagnostics = connectionJournal.health();
   checks.session_alerts = { flapping: reconnectTracker.flappingCount(), needing_qr: [...sessions.values()].filter((session) => session.status === "needs_reconnect").length, reconnecting: [...sessions.values()].filter((session) => session.status === "reconnecting").length };
   let healthy = true;
